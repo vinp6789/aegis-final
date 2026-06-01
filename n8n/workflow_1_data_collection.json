@@ -1,0 +1,510 @@
+{
+  "name": "Aegis Workflow 1 - Data Collection",
+  "nodes": [
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "everyHour"
+            }
+          ]
+        }
+      },
+      "id": "cron-hourly-data-collection",
+      "name": "Hourly UTC Trigger",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_1_data_collection', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+      },
+      "id": "log-start",
+      "name": "Log Start UTC",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "={{$env.AEGIS_NSE_ADAPTER_URL || 'http://aegis-ingestion:8000/adapters/nse/daily'}}",
+        "method": "GET",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Aegis-Workflow",
+              "value": "workflow_1_data_collection"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "fetch-nse",
+      "name": "Fetch NSE Daily",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        480,
+        -160
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "={{$env.AEGIS_RBI_ADAPTER_URL || 'http://aegis-ingestion:8000/adapters/rbi/liquidity'}}",
+        "method": "GET",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Aegis-Workflow",
+              "value": "workflow_1_data_collection"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "fetch-rbi",
+      "name": "Fetch RBI Liquidity",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        480,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "={{$env.AEGIS_STABLECOIN_ADAPTER_URL || 'http://aegis-ingestion:8000/adapters/defillama/stablecoins'}}",
+        "method": "GET",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Aegis-Workflow",
+              "value": "workflow_1_data_collection"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "fetch-stablecoins",
+      "name": "Fetch Stablecoin Supply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        480,
+        160
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "={{$env.AEGIS_QUALITY_URL || 'http://aegis-ingestion:8000/data-quality/validate'}}",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={\"timestamp\":\"{{$now.toUTC().toISO()}}\",\"workflow\":\"workflow_1_data_collection\",\"sources\":{\"nse\":{{$json}},\"rbi\":{{$json}},\"stablecoins\":{{$json}}}}",
+        "options": {
+          "timeout": 45000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "validate-payloads",
+      "name": "Validate Payloads",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        760,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.statusCode >= 200 && $json.statusCode < 300}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "quality-success-check",
+      "name": "Quality Success?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1000,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO daily_market_metrics (timestamp, asset_id, open, high, low, close, volume, market_cap) SELECT NOW() AT TIME ZONE 'UTC', COALESCE(item->>'asset_id', 'UNKNOWN'), NULLIF(item->>'open','')::NUMERIC, NULLIF(item->>'high','')::NUMERIC, NULLIF(item->>'low','')::NUMERIC, NULLIF(item->>'close','')::NUMERIC, NULLIF(item->>'volume','')::NUMERIC, NULLIF(item->>'market_cap','')::NUMERIC FROM jsonb_array_elements(COALESCE(($json->'body'->'daily_market_metrics')::jsonb, '[]'::jsonb)) AS item ON CONFLICT DO NOTHING;"
+      },
+      "id": "save-market-metrics",
+      "name": "Save Market Metrics",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1240,
+        -120
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO macro_liquidity_indicators (timestamp, indicator_code, value, release_date, source_name) SELECT NOW() AT TIME ZONE 'UTC', COALESCE(item->>'indicator_code', 'UNKNOWN'), NULLIF(item->>'value','')::NUMERIC, COALESCE(NULLIF(item->>'release_date','')::TIMESTAMPTZ, NOW() AT TIME ZONE 'UTC'), COALESCE(item->>'source_name','workflow_1_data_collection') FROM jsonb_array_elements(COALESCE(($json->'body'->'macro_liquidity_indicators')::jsonb, '[]'::jsonb)) AS item ON CONFLICT DO NOTHING;"
+      },
+      "id": "save-liquidity-indicators",
+      "name": "Save Liquidity Indicators",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1240,
+        40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO stablecoin_liquidity_growth (timestamp, token_symbol, circulating_supply, supply_growth_1d, supply_growth_7d) SELECT NOW() AT TIME ZONE 'UTC', COALESCE(item->>'token_symbol', 'UNKNOWN'), GREATEST(NULLIF(item->>'circulating_supply','')::NUMERIC, 0.00000001), NULLIF(item->>'supply_growth_1d','')::NUMERIC, NULLIF(item->>'supply_growth_7d','')::NUMERIC FROM jsonb_array_elements(COALESCE(($json->'body'->'stablecoin_liquidity_growth')::jsonb, '[]'::jsonb)) AS item ON CONFLICT DO NOTHING;"
+      },
+      "id": "save-stablecoins",
+      "name": "Save Stablecoins",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1240,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_1_data_collection', 'payload', 'DATA_COLLECTION_VALIDATION_FAILURE', CAST($json AS TEXT), 'CRITICAL');"
+      },
+      "id": "log-validation-error",
+      "name": "Log Validation Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1240,
+        400
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_1_data_collection', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+      },
+      "id": "log-success",
+      "name": "Log Success UTC",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1500,
+        40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_1_data_collection', 'runtime', 'DATA_COLLECTION_RUNTIME_ERROR', CAST($json AS TEXT), 'CRITICAL');"
+      },
+      "id": "global-error-log",
+      "name": "Global Error Log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1500,
+        400
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "Hourly UTC Trigger": {
+      "main": [
+        [
+          {
+            "node": "Log Start UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Start UTC": {
+      "main": [
+        [
+          {
+            "node": "Fetch NSE Daily",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch RBI Liquidity",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Stablecoin Supply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch NSE Daily": {
+      "main": [
+        [
+          {
+            "node": "Validate Payloads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch RBI Liquidity": {
+      "main": [
+        [
+          {
+            "node": "Validate Payloads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Stablecoin Supply": {
+      "main": [
+        [
+          {
+            "node": "Validate Payloads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Payloads": {
+      "main": [
+        [
+          {
+            "node": "Quality Success?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Quality Success?": {
+      "main": [
+        [
+          {
+            "node": "Save Market Metrics",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Save Liquidity Indicators",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Save Stablecoins",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Validation Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Market Metrics": {
+      "main": [
+        [
+          {
+            "node": "Log Success UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Liquidity Indicators": {
+      "main": [
+        [
+          {
+            "node": "Log Success UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Stablecoins": {
+      "main": [
+        [
+          {
+            "node": "Log Success UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Validation Error": {
+      "main": [
+        [
+          {
+            "node": "Global Error Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionTimeout": 300,
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "timezone": "UTC"
+  },
+  "active": false,
+  "versionId": "workflow-1-data-collection-v1",
+  "meta": {
+    "phase": 17,
+    "workflow": 1,
+    "standardNodesOnly": true,
+    "futureWorkflowsIncluded": false
+  }
+}

@@ -1,0 +1,514 @@
+{
+  "name": "Aegis Workflow 7 - Governance",
+  "nodes": [
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "custom",
+              "cronExpression": "15 16 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cron-daily-governance",
+      "name": "Daily Governance UTC Trigger",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_7_governance', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+      },
+      "id": "log-start",
+      "name": "Log Start UTC",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT timestamp AT TIME ZONE 'UTC' AS timestamp_utc, target_scope, crash_prob_1m, crash_prob_3m, crash_prob_6m, crash_prob_9m, crash_prob_12m, early_warning_score, confidence_score, current_regime FROM probability_matrix_outputs_v3 ORDER BY timestamp DESC LIMIT 1;"
+      },
+      "id": "fetch-latest-probabilities",
+      "name": "Fetch Latest Probabilities",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        500,
+        -160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT COALESCE(MAX(CASE WHEN exception_type = 'SCENARIO_GENERATION_OUTPUTS' THEN 1 ELSE 0 END), 0) AS scenario_outputs_ready, COALESCE(MAX(CASE WHEN bad_value_raw ILIKE '%TAIL_RISK%' THEN 1 ELSE 0 END), 0) AS tail_risk_present, MAX(timestamp) AT TIME ZONE 'UTC' AS latest_scenario_timestamp_utc FROM data_quality_exceptions WHERE source_name = 'workflow_5_scenario_generation' AND timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '7 days';"
+      },
+      "id": "fetch-scenario-severity",
+      "name": "Fetch Scenario Severity",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        500,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT COALESCE(MIN(source_health_score), 100.0) AS min_source_health, COALESCE(MAX(freshness_minutes), 0) AS max_freshness_minutes FROM ingestion_source_health WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '24 hours';"
+      },
+      "id": "fetch-source-health",
+      "name": "Fetch Source Health",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        500,
+        160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT CASE WHEN COALESCE(MAX(crash_prob_12m), 0.0) >= 0.80 OR COALESCE(MAX(early_warning_score), 0.0) >= 80.0 OR COALESCE(MAX(current_regime::TEXT), 'LOW_RISK') = 'CRISIS' THEN TRUE ELSE FALSE END AS kill_switch_required, CASE WHEN COALESCE(MAX(crash_prob_12m), 0.0) >= 0.60 OR COALESCE(MAX(early_warning_score), 0.0) >= 60.0 THEN TRUE ELSE FALSE END AS governance_alert_required FROM probability_matrix_outputs_v3 WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '7 days';"
+      },
+      "id": "verify-probability-thresholds",
+      "name": "Verify Probability Thresholds",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        780,
+        -160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT CASE WHEN COALESCE(MAX(CASE WHEN bad_value_raw ILIKE '%TAIL_RISK%' OR bad_value_raw ILIKE '%CRYPTO_CRISIS%' OR bad_value_raw ILIKE '%LIQUIDITY_SHOCK%' THEN 1 ELSE 0 END), 0) = 1 THEN TRUE ELSE FALSE END AS severe_scenario_detected FROM data_quality_exceptions WHERE source_name = 'workflow_5_scenario_generation' AND timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '7 days';"
+      },
+      "id": "verify-scenario-thresholds",
+      "name": "Verify Scenario Thresholds",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        780,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT CASE WHEN COALESCE(MAX(crash_prob_12m) - MIN(crash_prob_12m), 0.0) >= 0.20 OR COALESCE(MAX(early_warning_score) - MIN(early_warning_score), 0.0) >= 20.0 THEN TRUE ELSE FALSE END AS systemic_stress_escalation FROM probability_matrix_outputs_v3 WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '30 days';"
+      },
+      "id": "detect-systemic-stress-escalation",
+      "name": "Detect Systemic Stress Escalation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        780,
+        160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_7_governance', 'governance_decision', 'GOVERNANCE_DECISION_LOG', jsonb_build_object('probability_thresholds_checked', true, 'scenario_severity_checked', true, 'systemic_stress_escalation_checked', true, 'kill_switch_logic_checked', true, 'timestamp_utc', NOW() AT TIME ZONE 'UTC')::TEXT, 'LOW');"
+      },
+      "id": "log-governance-decision",
+      "name": "Log Governance Decision",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.kill_switch_required === true || $json.governance_alert_required === true || $json.severe_scenario_detected === true || $json.systemic_stress_escalation === true}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "governance-alert-check",
+      "name": "Governance Alert Required?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.AEGIS_GOVERNANCE_WEBHOOK_URL || 'http://aegis-alert-router:8080/webhook/governance'}}",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={\"timestamp\":\"{{$now.toUTC().toISO()}}\",\"workflow\":\"workflow_7_governance\",\"alert_type\":\"governance_alert\",\"probability_thresholds_checked\":true,\"scenario_severity_checked\":true,\"systemic_stress_escalation_checked\":true}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "trigger-governance-alert",
+      "name": "Trigger Governance Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1580,
+        -140
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "={{$env.AEGIS_KILL_SWITCH_WEBHOOK_URL || 'http://aegis-alert-router:8080/webhook/kill-switch'}}",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={\"timestamp\":\"{{$now.toUTC().toISO()}}\",\"workflow\":\"workflow_7_governance\",\"action\":\"LOCK_PREDICTIONS_IF_REQUIRED\",\"reason\":\"systemic_stress_or_threshold_breach\"}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "trigger-kill-switch",
+      "name": "Trigger Kill Switch Logic",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1580,
+        40
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_7_governance', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+      },
+      "id": "log-success",
+      "name": "Log Success UTC",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1840,
+        -40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_7_governance', 'governance_runtime', 'GOVERNANCE_FAILURE', CAST($json AS TEXT), 'CRITICAL');"
+      },
+      "id": "log-governance-error",
+      "name": "Log Governance Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1580,
+        260
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "Daily Governance UTC Trigger": {
+      "main": [
+        [
+          {
+            "node": "Log Start UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Start UTC": {
+      "main": [
+        [
+          {
+            "node": "Fetch Latest Probabilities",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Scenario Severity",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Source Health",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Latest Probabilities": {
+      "main": [
+        [
+          {
+            "node": "Verify Probability Thresholds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Scenario Severity": {
+      "main": [
+        [
+          {
+            "node": "Verify Scenario Thresholds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Source Health": {
+      "main": [
+        [
+          {
+            "node": "Detect Systemic Stress Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Probability Thresholds": {
+      "main": [
+        [
+          {
+            "node": "Log Governance Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Scenario Thresholds": {
+      "main": [
+        [
+          {
+            "node": "Log Governance Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect Systemic Stress Escalation": {
+      "main": [
+        [
+          {
+            "node": "Log Governance Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Governance Decision": {
+      "main": [
+        [
+          {
+            "node": "Governance Alert Required?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Governance Alert Required?": {
+      "main": [
+        [
+          {
+            "node": "Trigger Governance Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Trigger Kill Switch Logic",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Success UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trigger Governance Alert": {
+      "main": [
+        [
+          {
+            "node": "Log Success UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trigger Kill Switch Logic": {
+      "main": [
+        [
+          {
+            "node": "Log Success UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionTimeout": 600,
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "timezone": "UTC"
+  },
+  "active": false,
+  "versionId": "workflow-7-governance-v1",
+  "meta": {
+    "phase": 17,
+    "workflow": 7,
+    "standardNodesOnly": true,
+    "futureWorkflowsIncluded": false,
+    "schemaModified": false
+  }
+}

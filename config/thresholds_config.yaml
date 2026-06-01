@@ -1,0 +1,10 @@
+shock_std_bounds:
+  mild: 0.5
+  moderate: 1.0
+  severe: 2.0
+  extreme: 3.0
+counterfactual:
+  top_k: 5
+  action_step: 10.0
+novelty:
+  max_mahalanobis: 6.0

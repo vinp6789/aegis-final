@@ -1,0 +1,494 @@
+{
+  "name": "Aegis Workflow 6 - Reporting",
+  "nodes": [
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "custom",
+              "cronExpression": "0 16 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cron-daily-reporting",
+      "name": "Daily Reporting UTC Trigger",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_6_reporting', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+      },
+      "id": "log-start",
+      "name": "Log Start UTC",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT timestamp AT TIME ZONE 'UTC' AS timestamp_utc, target_scope, crash_prob_1m, crash_prob_3m, crash_prob_6m, crash_prob_9m, crash_prob_12m, pump_prob_1m, pump_prob_3m, pump_prob_6m, pump_prob_9m, pump_prob_12m, early_warning_score, confidence_score, current_regime FROM probability_matrix_outputs_v3 ORDER BY timestamp DESC LIMIT 1;"
+      },
+      "id": "fetch-probability-report",
+      "name": "Fetch Probability Report",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        500,
+        -240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT indicator_code, COALESCE(value, 0.0) AS value, timestamp AT TIME ZONE 'UTC' AS timestamp_utc FROM macro_liquidity_indicators WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '7 days' ORDER BY timestamp DESC LIMIT 50;"
+      },
+      "id": "fetch-liquidity-summary",
+      "name": "Fetch Liquidity Summary",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        500,
+        -80
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT source_name, exception_type, bad_value_raw, timestamp AT TIME ZONE 'UTC' AS timestamp_utc FROM data_quality_exceptions WHERE source_name IN ('workflow_5_scenario_generation', 'forecast_auditor', 'explainability_engine') AND timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '7 days' ORDER BY timestamp DESC LIMIT 50;"
+      },
+      "id": "fetch-scenario-and-analog-summary",
+      "name": "Fetch Scenario Analog Summary",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        500,
+        80
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT source_name, source_health_score, freshness_minutes, timestamp AT TIME ZONE 'UTC' AS timestamp_utc FROM ingestion_source_health WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '24 hours' ORDER BY timestamp DESC LIMIT 50;"
+      },
+      "id": "fetch-data-health-summary",
+      "name": "Fetch Data Health Summary",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        500,
+        240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_6_reporting', 'structured_report', 'REPORT_PAYLOAD_PREPARED', jsonb_build_object('report_type', 'daily_forecast_summary', 'probability_report', true, 'liquidity_breadth_summary', true, 'scenario_summary', true, 'historical_analog_summary', true, 'telegram_payload_prepared', true, 'email_payload_prepared', true, 'webhook_payload_prepared', true, 'timestamp_utc', NOW() AT TIME ZONE 'UTC')::TEXT, 'LOW');"
+      },
+      "id": "format-structured-report",
+      "name": "Format Structured Report",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        820,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json !== undefined}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "report-format-check",
+      "name": "Report Format OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.AEGIS_REPORT_WEBHOOK_URL || 'http://aegis-alert-router:8080/webhook/report'}}",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={\"timestamp\":\"{{$now.toUTC().toISO()}}\",\"workflow\":\"workflow_6_reporting\",\"channel\":\"webhook\",\"title\":\"Aegis Daily Forecast Summary\",\"payload\":{\"probability_report\":true,\"liquidity_breadth_summary\":true,\"scenario_summary\":true,\"historical_analog_summary\":true}}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "prepare-webhook-payload",
+      "name": "Prepare Webhook Payload",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1340,
+        -160
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "={{$env.AEGIS_TELEGRAM_WEBHOOK_URL || 'http://aegis-alert-router:8080/webhook/telegram'}}",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={\"timestamp\":\"{{$now.toUTC().toISO()}}\",\"workflow\":\"workflow_6_reporting\",\"channel\":\"telegram\",\"message\":\"Aegis daily forecast summary prepared. Probability, liquidity, breadth, scenario, and analog sections are available.\"}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "prepare-telegram-payload",
+      "name": "Prepare Telegram Payload",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1340,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "={{$env.AEGIS_EMAIL_WEBHOOK_URL || 'http://aegis-alert-router:8080/webhook/email'}}",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={\"timestamp\":\"{{$now.toUTC().toISO()}}\",\"workflow\":\"workflow_6_reporting\",\"channel\":\"email\",\"subject\":\"Aegis Daily Forecast Summary\",\"body\":\"Daily and weekly forecast summaries are ready with probability, liquidity, breadth, scenario, and historical analog sections.\"}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "prepare-email-payload",
+      "name": "Prepare Email Payload",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1340,
+        160
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_6_reporting', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+      },
+      "id": "log-success",
+      "name": "Log Success UTC",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1620,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_6_reporting', 'reporting_runtime', 'REPORTING_FAILURE', CAST($json AS TEXT), 'CRITICAL');"
+      },
+      "id": "log-reporting-error",
+      "name": "Log Reporting Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        360
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "Daily Reporting UTC Trigger": {
+      "main": [
+        [
+          {
+            "node": "Log Start UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Start UTC": {
+      "main": [
+        [
+          {
+            "node": "Fetch Probability Report",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Liquidity Summary",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Scenario Analog Summary",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Data Health Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Probability Report": {
+      "main": [
+        [
+          {
+            "node": "Format Structured Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Liquidity Summary": {
+      "main": [
+        [
+          {
+            "node": "Format Structured Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Scenario Analog Summary": {
+      "main": [
+        [
+          {
+            "node": "Format Structured Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Data Health Summary": {
+      "main": [
+        [
+          {
+            "node": "Format Structured Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Structured Report": {
+      "main": [
+        [
+          {
+            "node": "Report Format OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Report Format OK?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Webhook Payload",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prepare Telegram Payload",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prepare Email Payload",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Reporting Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Webhook Payload": {
+      "main": [
+        [
+          {
+            "node": "Log Success UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Telegram Payload": {
+      "main": [
+        [
+          {
+            "node": "Log Success UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Email Payload": {
+      "main": [
+        [
+          {
+            "node": "Log Success UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionTimeout": 600,
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "timezone": "UTC"
+  },
+  "active": false,
+  "versionId": "workflow-6-reporting-v1",
+  "meta": {
+    "phase": 17,
+    "workflow": 6,
+    "standardNodesOnly": true,
+    "futureWorkflowsIncluded": false,
+    "schemaModified": false
+  }
+}

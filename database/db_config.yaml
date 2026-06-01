@@ -1,0 +1,43 @@
+database:
+  engine: postgresql
+  extension: timescaledb
+  host: localhost
+  port: 5432
+  database: aegis
+  schema: public
+  username: aegis_user
+  password_env_var: AEGIS_DB_PASSWORD
+  sslmode: prefer
+  connect_timeout_seconds: 10
+
+pool:
+  min_connections: 1
+  max_connections: 5
+  idle_timeout_seconds: 300
+  statement_timeout_ms: 30000
+
+timezone:
+  storage: UTC
+  require_timezone_aware_timestamps: true
+
+migrations:
+  directory: database/migrations
+  apply_order:
+    - 001_initialize_schema.sql
+    - 002_create_market_hypertables.sql
+    - 003_create_v2_hypertables.sql
+    - 004_create_v3_hypertables.sql
+    - 005_create_discovery_hypertables.sql
+    - 006_create_backtest_hypertables.sql
+
+timescaledb:
+  compression:
+    compress_after_days: 90
+    enabled_tables:
+      - daily_market_metrics
+      - macro_liquidity_indicators
+      - crypto_onchain_metrics
+      - stablecoin_liquidity_growth
+  retention:
+    data_quality_exceptions_days: 180
+    daily_market_metrics_days: 730

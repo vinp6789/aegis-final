@@ -1,0 +1,451 @@
+{
+  "name": "Aegis Workflow 5 - Scenario Generation",
+  "nodes": [
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "custom",
+              "cronExpression": "45 15 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cron-daily-scenario-generation",
+      "name": "Daily Scenario UTC Trigger",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_5_scenario_generation', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+      },
+      "id": "log-start",
+      "name": "Log Start UTC",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT timestamp AT TIME ZONE 'UTC' AS timestamp_utc, target_scope, crash_prob_1m, crash_prob_3m, crash_prob_6m, crash_prob_9m, crash_prob_12m, pump_prob_1m, pump_prob_3m, pump_prob_6m, pump_prob_9m, pump_prob_12m, early_warning_score, confidence_score, current_regime FROM probability_matrix_outputs_v3 WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '7 days' ORDER BY timestamp DESC LIMIT 1;"
+      },
+      "id": "fetch-latest-probability-matrix",
+      "name": "Fetch Latest Probability Matrix",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        500,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.target_scope !== undefined}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "probability-input-check",
+      "name": "Probability Input Ready?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        760,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "command": "python -m analytics.synthesis.scenario_engine",
+        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+      },
+      "id": "run-scenario-engine",
+      "name": "Run Scenario Engine",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        -220
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "command": "python -c \"from analytics.synthesis.scenario_engine import SCENARIO_NAMES; required={'BASE','BULL','BEAR','TAIL_RISK','LIQUIDITY_SHOCK','INDIA_STRESS','CRYPTO_CRISIS'}; assert set(SCENARIO_NAMES)==required; print('SCENARIOS_OK')\"",
+        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+      },
+      "id": "validate-scenario-set",
+      "name": "Validate Scenario Set",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1280,
+        -220
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "command": "python -c \"from datetime import datetime, timezone; from analytics.synthesis.probability_aggregator import AggregatorInput; from analytics.synthesis.scenario_engine import ScenarioEngine; base=AggregatorInput(timestamp=datetime.now(timezone.utc)); paths=ScenarioEngine().counterfactual_paths(base); assert len(paths)==5; assert len({p.action_name for p in paths})==5; print('COUNTERFACTUALS_OK')\"",
+        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+      },
+      "id": "generate-counterfactual-pathways",
+      "name": "Generate Counterfactual Pathways",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        -220
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "command": "python -c \"from datetime import datetime, timezone; from analytics.synthesis.probability_aggregator import AggregatorInput; from analytics.synthesis.scenario_engine import ScenarioEngine; base=AggregatorInput(timestamp=datetime.now(timezone.utc)); run=ScenarioEngine().run(base, [base]); assert all(0<=s.novelty_score<=100 for s in run.scenarios); print('NOVELTY_OK')\"",
+        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+      },
+      "id": "check-novelty-scores",
+      "name": "Check Novelty Scores",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1800,
+        -220
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "command": "python -c \"from datetime import datetime, timezone; from analytics.synthesis.probability_aggregator import AggregatorInput; from analytics.synthesis.scenario_engine import ScenarioEngine, REGIME_STATES; base=AggregatorInput(timestamp=datetime.now(timezone.utc)); matrix=ScenarioEngine().run(base, [base]).transition_matrix; assert set(matrix)==set(REGIME_STATES); assert all(abs(sum(row.values())-1.0)<1e-6 for row in matrix.values()); print('MARKOV_OK')\"",
+        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+      },
+      "id": "validate-markov-transition-matrix",
+      "name": "Validate Markov Transition Matrix",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        2060,
+        -220
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.exitCode === 0 || $json.exitCode === undefined}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "scenario-success-check",
+      "name": "Scenario Checks OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2320,
+        -220
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_5_scenario_generation', 'scenario_outputs', 'SCENARIO_GENERATION_OUTPUTS', jsonb_build_object('scenarios', jsonb_build_array('BASE','BULL','BEAR','TAIL_RISK','LIQUIDITY_SHOCK','INDIA_STRESS','CRYPTO_CRISIS'), 'counterfactual_pathways_generated', true, 'novelty_scores_checked', true, 'markov_transition_matrix_validated', true, 'timestamp_utc', NOW() AT TIME ZONE 'UTC')::TEXT, 'LOW');"
+      },
+      "id": "persist-scenario-outputs",
+      "name": "Persist Scenario Outputs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2580,
+        -300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_5_scenario_generation', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+      },
+      "id": "log-success",
+      "name": "Log Success UTC",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2840,
+        -300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_5_scenario_generation', 'scenario_runtime', 'SCENARIO_GENERATION_FAILURE', CAST($json AS TEXT), 'CRITICAL');"
+      },
+      "id": "log-scenario-error",
+      "name": "Log Scenario Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2580,
+        80
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_5_scenario_generation', 'probability_input', 'SCENARIO_INPUT_MISSING', CAST($json AS TEXT), 'CRITICAL');"
+      },
+      "id": "log-input-error",
+      "name": "Log Input Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "Daily Scenario UTC Trigger": {
+      "main": [
+        [
+          {
+            "node": "Log Start UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Start UTC": {
+      "main": [
+        [
+          {
+            "node": "Fetch Latest Probability Matrix",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Latest Probability Matrix": {
+      "main": [
+        [
+          {
+            "node": "Probability Input Ready?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Probability Input Ready?": {
+      "main": [
+        [
+          {
+            "node": "Run Scenario Engine",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Input Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Scenario Engine": {
+      "main": [
+        [
+          {
+            "node": "Validate Scenario Set",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Scenario Set": {
+      "main": [
+        [
+          {
+            "node": "Generate Counterfactual Pathways",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Counterfactual Pathways": {
+      "main": [
+        [
+          {
+            "node": "Check Novelty Scores",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Novelty Scores": {
+      "main": [
+        [
+          {
+            "node": "Validate Markov Transition Matrix",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Markov Transition Matrix": {
+      "main": [
+        [
+          {
+            "node": "Scenario Checks OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scenario Checks OK?": {
+      "main": [
+        [
+          {
+            "node": "Persist Scenario Outputs",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Scenario Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Scenario Outputs": {
+      "main": [
+        [
+          {
+            "node": "Log Success UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionTimeout": 900,
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "timezone": "UTC"
+  },
+  "active": false,
+  "versionId": "workflow-5-scenario-generation-v1",
+  "meta": {
+    "phase": 17,
+    "workflow": 5,
+    "standardNodesOnly": true,
+    "futureWorkflowsIncluded": false,
+    "schemaModified": false
+  }
+}

@@ -1,0 +1,401 @@
+{
+  "name": "Aegis Workflow 3 - Model Training",
+  "nodes": [
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "custom",
+              "cronExpression": "30 2 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cron-daily-training-check",
+      "name": "Daily Training UTC Trigger",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_3_model_training', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+      },
+      "id": "log-start",
+      "name": "Log Start UTC",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT COALESCE(MAX((bad_value_raw::jsonb ->> 'psi')::NUMERIC), 0.0) AS latest_psi, COALESCE(MAX(CASE WHEN exception_type = 'GOVERNANCE_RETRAINING_TRIGGER' THEN 1 ELSE 0 END), 0) AS retraining_triggered FROM data_quality_exceptions WHERE source_name = 'governance_engine' AND timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '30 days';"
+      },
+      "id": "fetch-governance-trigger",
+      "name": "Fetch Governance Trigger",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        500,
+        -120
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT COUNT(*) AS feature_rows FROM probability_matrix_outputs_v3 WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '180 days';"
+      },
+      "id": "fetch-training-readiness",
+      "name": "Fetch Training Readiness",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        500,
+        120
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.retraining_triggered === 1 || $json.latest_psi >= 0.25}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "training-required-check",
+      "name": "Training Required?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        760,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "command": "python -m analytics.validation.splitter",
+        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+      },
+      "id": "run-walk-forward-validation",
+      "name": "Run Walk Forward Validation",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        -220
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true,
+      "notes": "Uses built-in Execute Command node to run local open-source validation jobs."
+    },
+    {
+      "parameters": {
+        "command": "python -m analytics.validation.backtest_engine",
+        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+      },
+      "id": "run-backtesting",
+      "name": "Run Backtesting",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        -40
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "command": "python -m analytics.validation.calibration",
+        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+      },
+      "id": "run-probability-calibration",
+      "name": "Run Probability Calibration",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        140
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_3_model_training', 'training_metrics', 'MODEL_TRAINING_METRICS', jsonb_build_object('walk_forward_status', 'completed', 'backtest_status', 'completed', 'calibration_status', 'completed', 'timestamp_utc', NOW() AT TIME ZONE 'UTC')::TEXT, 'LOW');"
+      },
+      "id": "store-model-metrics",
+      "name": "Store Model Metrics",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        -40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_3_model_training', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+      },
+      "id": "log-success",
+      "name": "Log Success UTC",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        -40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_3_model_training', 1.0, 0, 1440, 100) ON CONFLICT DO NOTHING;"
+      },
+      "id": "log-no-training-needed",
+      "name": "Log No Training Needed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        360
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_3_model_training', 'training_runtime', 'MODEL_TRAINING_FAILURE', CAST($json AS TEXT), 'CRITICAL');"
+      },
+      "id": "log-training-error",
+      "name": "Log Training Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "Daily Training UTC Trigger": {
+      "main": [
+        [
+          {
+            "node": "Log Start UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Start UTC": {
+      "main": [
+        [
+          {
+            "node": "Fetch Governance Trigger",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Training Readiness",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Governance Trigger": {
+      "main": [
+        [
+          {
+            "node": "Training Required?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Training Required?": {
+      "main": [
+        [
+          {
+            "node": "Run Walk Forward Validation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log No Training Needed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Walk Forward Validation": {
+      "main": [
+        [
+          {
+            "node": "Run Backtesting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Backtesting": {
+      "main": [
+        [
+          {
+            "node": "Run Probability Calibration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Probability Calibration": {
+      "main": [
+        [
+          {
+            "node": "Store Model Metrics",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log Training Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Model Metrics": {
+      "main": [
+        [
+          {
+            "node": "Log Success UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Training Error": {
+      "main": [
+        [
+          {
+            "node": "Log No Training Needed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionTimeout": 900,
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "timezone": "UTC"
+  },
+  "active": false,
+  "versionId": "workflow-3-model-training-v1",
+  "meta": {
+    "phase": 17,
+    "workflow": 3,
+    "standardNodesOnly": true,
+    "futureWorkflowsIncluded": false,
+    "schemaModified": false
+  }
+}

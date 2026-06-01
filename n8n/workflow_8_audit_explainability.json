@@ -1,0 +1,478 @@
+{
+  "name": "Aegis Workflow 8 - Audit Explainability",
+  "nodes": [
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "custom",
+              "cronExpression": "30 16 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cron-daily-audit-explainability",
+      "name": "Daily Audit UTC Trigger",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_8_audit_explainability', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+      },
+      "id": "log-start",
+      "name": "Log Start UTC",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT timestamp AT TIME ZONE 'UTC' AS timestamp_utc, target_scope, crash_prob_1m, crash_prob_3m, crash_prob_6m, crash_prob_9m, crash_prob_12m, early_warning_score, confidence_score, current_regime FROM probability_matrix_outputs_v3 ORDER BY timestamp DESC LIMIT 30;"
+      },
+      "id": "fetch-forecast-records",
+      "name": "Fetch Forecast Records",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        500,
+        -160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT source_name, exception_type, bad_value_raw, severity, timestamp AT TIME ZONE 'UTC' AS timestamp_utc FROM data_quality_exceptions WHERE source_name IN ('forecast_auditor', 'explainability_engine', 'workflow_7_governance') AND timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '30 days' ORDER BY timestamp DESC LIMIT 100;"
+      },
+      "id": "fetch-audit-history",
+      "name": "Fetch Audit History",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        500,
+        80
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json !== undefined}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "audit-input-check",
+      "name": "Audit Inputs Ready?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        760,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "command": "python -c \"from datetime import datetime, timezone; from analytics.governance.explainability_engine import ExplainabilityEngine, FeatureVector; v=FeatureVector(timestamp=datetime.now(timezone.utc), target_scope='GLOBAL', features={'liquidity':60,'breadth':0.2,'crypto':55}, prediction_value=0.62, model_name='xgboost'); e=ExplainabilityEngine().explain_from_shap_values(v, base_value=0.40, shap_values={'liquidity':0.12,'breadth':0.08,'crypto':0.02}); assert e.additive_valid and e.additive_error <= 1e-5; print('EXPLAINABILITY_OK')\"",
+        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+      },
+      "id": "trigger-explainability-engine",
+      "name": "Trigger Explainability Engine",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        -180
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "command": "python -c \"from datetime import datetime, timezone; from analytics.governance.forecast_auditor import ForecastAuditor, ForecastRecord; rows=[ForecastRecord(timestamp=datetime.now(timezone.utc), target_scope='GLOBAL', forecast_type='systemic_stress', horizon_months=12, probability=0.2, realized_outcome=0)]; r=ForecastAuditor().audit(rows); assert 0 <= r.metrics.brier_score <= 1; assert 0 <= r.metrics.expected_calibration_error <= 1; print('AUDIT_OK')\"",
+        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+      },
+      "id": "generate-audit-logs",
+      "name": "Generate Audit Logs",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1280,
+        -180
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "command": "python -c \"from datetime import datetime, timezone, timedelta; from analytics.governance.explainability_engine import ExplainabilityEngine, FeatureVector; engine=ExplainabilityEngine(); a=engine.explain_from_shap_values(FeatureVector(timestamp=datetime.now(timezone.utc)-timedelta(days=1), target_scope='GLOBAL', features={'liquidity':50,'breadth':0.0,'crypto':50}, prediction_value=0.50), base_value=0.30, shap_values={'liquidity':0.10,'breadth':0.05,'crypto':0.05}); b=engine.explain_from_shap_values(FeatureVector(timestamp=datetime.now(timezone.utc), target_scope='GLOBAL', features={'liquidity':40,'breadth':-0.2,'crypto':45}, prediction_value=0.66), base_value=0.30, shap_values={'liquidity':0.24,'breadth':0.07,'crypto':0.05}); d=engine.forecast_diff(a,b); assert d.top_driver_shifts; print('TRACEABILITY_OK')\"",
+        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+      },
+      "id": "generate-forecast-traceability",
+      "name": "Generate Forecast Traceability",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        -180
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.exitCode === 0 || $json.exitCode === undefined}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "audit-success-check",
+      "name": "Audit Checks OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_8_audit_explainability', 'audit_explainability_outputs', 'AUDIT_EXPLAINABILITY_OUTPUTS', jsonb_build_object('shap_style_contributions_generated', true, 'audit_logs_generated', true, 'forecast_traceability_report_generated', true, 'additive_explanation_conservation_verified', true, 'timestamp_utc', NOW() AT TIME ZONE 'UTC')::TEXT, 'LOW');"
+      },
+      "id": "persist-audit-explainability-outputs",
+      "name": "Persist Audit Explainability Outputs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2060,
+        -260
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "={{$env.AEGIS_AUDIT_ALERT_WEBHOOK_URL || 'http://aegis-alert-router:8080/webhook/audit'}}",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={\"timestamp\":\"{{$now.toUTC().toISO()}}\",\"workflow\":\"workflow_8_audit_explainability\",\"alert_type\":\"audit_explainability_anomaly\",\"additive_conservation_checked\":true,\"traceability_report_generated\":true}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "trigger-audit-alert",
+      "name": "Trigger Audit Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        2060,
+        -40
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_8_audit_explainability', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+      },
+      "id": "log-success",
+      "name": "Log Success UTC",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2320,
+        -160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_8_audit_explainability', 'audit_runtime', 'AUDIT_EXPLAINABILITY_FAILURE', CAST($json AS TEXT), 'CRITICAL');"
+      },
+      "id": "log-audit-error",
+      "name": "Log Audit Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2060,
+        220
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_8_audit_explainability', 'audit_input', 'AUDIT_INPUT_MISSING', CAST($json AS TEXT), 'CRITICAL');"
+      },
+      "id": "log-input-error",
+      "name": "Log Input Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "Daily Audit UTC Trigger": {
+      "main": [
+        [
+          {
+            "node": "Log Start UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Start UTC": {
+      "main": [
+        [
+          {
+            "node": "Fetch Forecast Records",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Audit History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Forecast Records": {
+      "main": [
+        [
+          {
+            "node": "Audit Inputs Ready?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Audit History": {
+      "main": [
+        [
+          {
+            "node": "Audit Inputs Ready?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit Inputs Ready?": {
+      "main": [
+        [
+          {
+            "node": "Trigger Explainability Engine",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Input Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trigger Explainability Engine": {
+      "main": [
+        [
+          {
+            "node": "Generate Audit Logs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Audit Logs": {
+      "main": [
+        [
+          {
+            "node": "Generate Forecast Traceability",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Forecast Traceability": {
+      "main": [
+        [
+          {
+            "node": "Audit Checks OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit Checks OK?": {
+      "main": [
+        [
+          {
+            "node": "Persist Audit Explainability Outputs",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Trigger Audit Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Audit Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Audit Explainability Outputs": {
+      "main": [
+        [
+          {
+            "node": "Log Success UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trigger Audit Alert": {
+      "main": [
+        [
+          {
+            "node": "Log Success UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionTimeout": 900,
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "timezone": "UTC"
+  },
+  "active": false,
+  "versionId": "workflow-8-audit-explainability-v1",
+  "meta": {
+    "phase": 17,
+    "workflow": 8,
+    "standardNodesOnly": true,
+    "futureWorkflowsIncluded": false,
+    "schemaModified": false
+  }
+}

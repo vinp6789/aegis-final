@@ -1,0 +1,9 @@
+search:
+  rolling_dtw_window_days: 63
+  decay_factor: 0.97
+  top_k: 3
+weights:
+  liquidity: 0.25
+  breadth: 0.25
+  regime_state: 0.20
+  probability_vectors: 0.30

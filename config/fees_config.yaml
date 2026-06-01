@@ -1,0 +1,9 @@
+asset_classes:
+  india_equity:
+    fee_rate: 0.0012
+    slippage_rate: 0.0005
+    description: "India Equity: 0.12% transaction tax + 0.05% slippage."
+  crypto:
+    fee_rate: 0.0010
+    slippage_rate: 0.0015
+    description: "Crypto: 0.10% taker fee + 0.15% slippage."

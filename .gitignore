@@ -1,0 +1,10 @@
+﻿.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+*.log
+registry.db
+online_store.db

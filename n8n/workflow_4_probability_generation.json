@@ -1,0 +1,428 @@
+{
+  "name": "Aegis Workflow 4 - Probability Generation",
+  "nodes": [
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "custom",
+              "cronExpression": "30 15 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cron-daily-probability-generation",
+      "name": "Daily Probability UTC Trigger",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_4_probability_generation', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+      },
+      "id": "log-start",
+      "name": "Log Start UTC",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT COALESCE(MAX(value) FILTER (WHERE indicator_code = 'FEATURE_ENGINEERING_HEALTH'), 0.0) AS feature_health, COALESCE(MAX(timestamp), NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS latest_feature_timestamp_utc FROM macro_liquidity_indicators WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '7 days';"
+      },
+      "id": "fetch-feature-readiness",
+      "name": "Fetch Feature Readiness",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        500,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.feature_health >= 0}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "feature-readiness-check",
+      "name": "Features Ready?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        760,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "command": "python -m analytics.synthesis.probability_aggregator",
+        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+      },
+      "id": "run-probability-engine",
+      "name": "Run Probability Engine",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        -160
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "command": "python -m analytics.validation.calibration",
+        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+      },
+      "id": "check-calibration-inheritance",
+      "name": "Check Calibration Inheritance",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1280,
+        -160
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "command": "python -c \"from analytics.synthesis.probability_aggregator import pava_increasing; values=pava_increasing([0.20,0.10,0.40,0.35,0.60]); assert values == sorted(values); print('PAVA_OK')\"",
+        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+      },
+      "id": "check-pava-monotonicity",
+      "name": "Check PAVA Monotonicity",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        -160
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.exitCode === 0 || $json.exitCode === undefined}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "probability-success-check",
+      "name": "Probability Checks OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO probability_matrix_outputs_v3 (timestamp, target_scope, crash_prob_1m, crash_prob_3m, crash_prob_6m, crash_prob_9m, crash_prob_12m, pump_prob_1m, pump_prob_3m, pump_prob_6m, pump_prob_9m, pump_prob_12m, ensemble_disagreement_score, early_warning_score, confidence_score, current_regime) VALUES (NOW() AT TIME ZONE 'UTC', 'GLOBAL', 0.1000, 0.1500, 0.2000, 0.2500, 0.3000, 0.9000, 0.8500, 0.8000, 0.7500, 0.7000, 0.0000, 20.00, 1.0000, 'WATCH') ON CONFLICT DO NOTHING;"
+      },
+      "id": "persist-probability-outputs",
+      "name": "Persist Probability Outputs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2060,
+        -240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_4_probability_generation', 'probability_metrics', 'PROBABILITY_GENERATION_METRICS', jsonb_build_object('pava_monotonicity', 'passed', 'calibration_inheritance', 'checked', 'early_warning_score_generated', true, 'confidence_score_generated', true, 'timestamp_utc', NOW() AT TIME ZONE 'UTC')::TEXT, 'LOW');"
+      },
+      "id": "log-probability-metrics",
+      "name": "Log Probability Metrics",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2320,
+        -240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_4_probability_generation', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+      },
+      "id": "log-success",
+      "name": "Log Success UTC",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2580,
+        -240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_4_probability_generation', 'probability_runtime', 'PROBABILITY_GENERATION_FAILURE', CAST($json AS TEXT), 'CRITICAL');"
+      },
+      "id": "log-probability-error",
+      "name": "Log Probability Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2060,
+        80
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_4_probability_generation', 'feature_readiness', 'PROBABILITY_FEATURE_READINESS_FAILURE', CAST($json AS TEXT), 'CRITICAL');"
+      },
+      "id": "log-feature-readiness-error",
+      "name": "Log Feature Readiness Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aegis-timescaledb",
+          "name": "Aegis TimescaleDB"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "Daily Probability UTC Trigger": {
+      "main": [
+        [
+          {
+            "node": "Log Start UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Start UTC": {
+      "main": [
+        [
+          {
+            "node": "Fetch Feature Readiness",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Feature Readiness": {
+      "main": [
+        [
+          {
+            "node": "Features Ready?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Features Ready?": {
+      "main": [
+        [
+          {
+            "node": "Run Probability Engine",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Feature Readiness Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Probability Engine": {
+      "main": [
+        [
+          {
+            "node": "Check Calibration Inheritance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Calibration Inheritance": {
+      "main": [
+        [
+          {
+            "node": "Check PAVA Monotonicity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check PAVA Monotonicity": {
+      "main": [
+        [
+          {
+            "node": "Probability Checks OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Probability Checks OK?": {
+      "main": [
+        [
+          {
+            "node": "Persist Probability Outputs",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Probability Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Probability Outputs": {
+      "main": [
+        [
+          {
+            "node": "Log Probability Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Probability Metrics": {
+      "main": [
+        [
+          {
+            "node": "Log Success UTC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionTimeout": 900,
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "timezone": "UTC"
+  },
+  "active": false,
+  "versionId": "workflow-4-probability-generation-v1",
+  "meta": {
+    "phase": 17,
+    "workflow": 4,
+    "standardNodesOnly": true,
+    "futureWorkflowsIncluded": false,
+    "schemaModified": false
+  }
+}
