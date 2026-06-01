@@ -18,12 +18,21 @@ from analytics.governance.governance_engine import GovernanceEngine, ModelErrorP
 from analytics.synthesis.probability_aggregator import (
     AggregatorInput,
     ProbabilityAggregator,
+    ProbabilityMatrix,
     ProbabilityMatrixPersistenceAdapter,
 )
 from analytics.synthesis.scenario_engine import ScenarioRun, ScenarioEngine
 
 
 app = FastAPI(title="Aegis Worker", version="1.1.0")
+
+DECISION_OUTPUT_FIELDS = (
+    "buy_score",
+    "hold_score",
+    "sell_score",
+    "expected_return_12m",
+    "expected_drawdown_12m",
+)
 
 
 @app.get("/health")
@@ -176,6 +185,7 @@ def run_model_training() -> dict[str, Any]:
 def run_probability() -> dict[str, Any]:
     input_data = build_aggregator_input()
     matrix = ProbabilityAggregator().aggregate(input_data)
+    decision = decision_outputs_from_matrix(matrix)
     with db_connection() as connection:
         ensure_runtime_tables(connection)
         ProbabilityMatrixPersistenceAdapter().persist(connection, matrix)
@@ -187,6 +197,7 @@ def run_probability() -> dict[str, Any]:
         "early_warning_score": matrix.early_warning_score,
         "confidence_score": matrix.confidence_score,
         "systemic_stress_12m": matrix.probabilities["systemic_stress"][12],
+        **decision,
     }
 
 
@@ -219,19 +230,26 @@ def run_scenario() -> dict[str, Any]:
 @app.post("/run/reporting")
 def run_reporting() -> dict[str, Any]:
     latest = latest_probability_row()
-    summary = format_telegram_summary(latest)
+    decision = decision_outputs_from_row(latest)
+    summary = format_telegram_summary(latest, decision)
     with db_connection() as connection:
         persist_exception_log(
             connection,
             source_name="workflow_6_reporting",
             field_name="structured_report",
             exception_type="REPORT_PAYLOAD_PREPARED",
-            payload={"telegram_summary": summary, "probability_report": bool(latest)},
+            payload={"telegram_summary": summary, "probability_report": bool(latest), "decision": decision},
             severity="LOW",
         )
         persist_source_health(connection, "workflow_6_reporting", 100.0)
         connection.commit()
-    return {"status": "ok", "timestamp_utc": utc_now().isoformat(), "telegram_summary": summary}
+    return {
+        "status": "ok",
+        "timestamp_utc": utc_now().isoformat(),
+        "telegram_summary": summary,
+        "confidence_score": latest.get("confidence_score") if latest else None,
+        **decision,
+    }
 
 
 @app.post("/run/governance")
@@ -308,6 +326,11 @@ def run_monthly_report() -> dict[str, Any]:
     reporting = run_reporting()
     governance = run_governance()
     audit = run_audit()
+    decision = {
+        field_name: reporting[field_name]
+        for field_name in DECISION_OUTPUT_FIELDS
+        if field_name in reporting
+    }
     return {
         "status": "ok",
         "data_collection": data_collection,
@@ -319,6 +342,7 @@ def run_monthly_report() -> dict[str, Any]:
         "governance": governance,
         "audit": audit,
         "telegram_summary": reporting["telegram_summary"],
+        **decision,
     }
 
 
@@ -587,8 +611,8 @@ def latest_probability_row() -> dict[str, Any]:
             cursor.execute(
                 """
                 SELECT timestamp, target_scope, crash_prob_1m, crash_prob_3m,
-                       crash_prob_6m, crash_prob_12m, early_warning_score,
-                       confidence_score, current_regime
+                       crash_prob_6m, crash_prob_12m, pump_prob_12m,
+                       early_warning_score, confidence_score, current_regime
                 FROM probability_matrix_outputs_v3
                 ORDER BY timestamp DESC
                 LIMIT 1
@@ -604,6 +628,7 @@ def latest_probability_row() -> dict[str, Any]:
         "crash_prob_3m",
         "crash_prob_6m",
         "crash_prob_12m",
+        "pump_prob_12m",
         "early_warning_score",
         "confidence_score",
         "current_regime",
@@ -777,9 +802,119 @@ def scenario_payload(run: ScenarioRun) -> dict[str, Any]:
     }
 
 
-def format_telegram_summary(row: dict[str, Any]) -> str:
+def decision_outputs_from_matrix(matrix: ProbabilityMatrix) -> dict[str, float]:
+    probabilities = matrix.probabilities
+    market_crash = probabilities["market_crash"][12]
+    systemic_stress = probabilities["systemic_stress"][12]
+    liquidity_contraction = probabilities["liquidity_contraction"][12]
+    sector_stress = probabilities["sector_stress"][12]
+    crypto_recovery = 1.0 - probabilities["crypto_risk_off"][12]
+    confidence = normalize_confidence(matrix.confidence_score)
+    panic_probability = bounded(
+        market_crash * 0.35
+        + systemic_stress * 0.35
+        + liquidity_contraction * 0.20
+        + sector_stress * 0.10,
+        0.0,
+        1.0,
+    )
+    recovery_probability = bounded(
+        (1.0 - panic_probability) * 0.55
+        + crypto_recovery * 0.25
+        + (1.0 - liquidity_contraction) * 0.20,
+        0.0,
+        1.0,
+    )
+    return build_decision_outputs(
+        panic_probability=panic_probability,
+        recovery_probability=recovery_probability,
+        confidence=confidence,
+        market_crash_12m=market_crash,
+        sector_stress_12m=sector_stress,
+    )
+
+
+def decision_outputs_from_row(row: dict[str, Any]) -> dict[str, float]:
+    if not row:
+        return {
+            "buy_score": 0.0,
+            "hold_score": 100.0,
+            "sell_score": 0.0,
+            "expected_return_12m": 0.0,
+            "expected_drawdown_12m": 0.0,
+        }
+    market_crash = read_float(row.get("crash_prob_12m"), 0.50)
+    recovery = read_float(row.get("pump_prob_12m"), 1.0 - market_crash)
+    confidence = normalize_confidence(read_float(row.get("confidence_score"), 0.50))
+    panic_probability = bounded(market_crash, 0.0, 1.0)
+    recovery_probability = bounded(recovery * 0.60 + (1.0 - market_crash) * 0.40, 0.0, 1.0)
+    return build_decision_outputs(
+        panic_probability=panic_probability,
+        recovery_probability=recovery_probability,
+        confidence=confidence,
+        market_crash_12m=market_crash,
+        sector_stress_12m=market_crash,
+    )
+
+
+def build_decision_outputs(
+    *,
+    panic_probability: float,
+    recovery_probability: float,
+    confidence: float,
+    market_crash_12m: float,
+    sector_stress_12m: float,
+) -> dict[str, float]:
+    panic = bounded(panic_probability, 0.0, 1.0)
+    recovery = bounded(recovery_probability, 0.0, 1.0)
+    confidence = normalize_confidence(confidence)
+    conviction = 0.55 + confidence * 0.45
+    raw_buy = max(0.01, recovery * conviction)
+    raw_sell = max(0.01, panic * conviction)
+    raw_hold = max(0.01, (1.0 - abs(recovery - panic)) * (1.15 - conviction))
+    total = raw_buy + raw_hold + raw_sell
+    buy_score = round(raw_buy / total * 100.0, 2)
+    sell_score = round(raw_sell / total * 100.0, 2)
+    hold_score = round(max(0.0, 100.0 - buy_score - sell_score), 2)
+    expected_return = bounded(recovery * 0.22 - panic * 0.28 + (confidence - 0.50) * 0.04, -0.50, 0.50)
+    expected_drawdown = bounded(panic * 0.45 + market_crash_12m * 0.10 + sector_stress_12m * 0.05, 0.0, 0.80)
+    return {
+        "buy_score": buy_score,
+        "hold_score": hold_score,
+        "sell_score": sell_score,
+        "expected_return_12m": round(expected_return, 6),
+        "expected_drawdown_12m": round(expected_drawdown, 6),
+    }
+
+
+def normalize_confidence(value: float) -> float:
+    confidence = read_float(value, 0.50)
+    if confidence > 1.0:
+        confidence /= 100.0
+    return bounded(confidence, 0.0, 1.0)
+
+
+def bounded(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, float(value)))
+
+
+def read_float(value: Any, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def format_percent(value: Any) -> str:
+    return f"{read_float(value, 0.0) * 100.0:.2f}%"
+
+
+def format_telegram_summary(row: dict[str, Any], decision: dict[str, float] | None = None) -> str:
     if not row:
         return "Aegis Monthly Alert\n\nNo probability output is available yet."
+    decision = decision or decision_outputs_from_row(row)
     return (
         "Aegis Monthly Alert\n\n"
         f"Regime: {row['current_regime']}\n"
@@ -787,6 +922,9 @@ def format_telegram_summary(row: dict[str, Any]) -> str:
         f"Crash 3M: {row['crash_prob_3m']}\n"
         f"Crash 6M: {row['crash_prob_6m']}\n"
         f"Crash 12M: {row['crash_prob_12m']}\n"
+        f"Buy/Hold/Sell: {decision['buy_score']}/{decision['hold_score']}/{decision['sell_score']}\n"
+        f"Expected Return 12M: {format_percent(decision['expected_return_12m'])}\n"
+        f"Expected Drawdown 12M: {format_percent(decision['expected_drawdown_12m'])}\n"
         f"Early Warning Score: {row['early_warning_score']}\n"
         f"Confidence: {row['confidence_score']}\n"
         f"Timestamp UTC: {row['timestamp']}"
