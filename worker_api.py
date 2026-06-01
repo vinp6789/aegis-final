@@ -61,6 +61,7 @@ def run_data_collection() -> dict[str, Any]:
     ]
     with db_connection() as connection:
         ensure_runtime_tables(connection)
+        upsert_asset_registry(connection, nse_rows)
         with connection.cursor() as cursor:
             cursor.executemany(
                 """
@@ -427,6 +428,34 @@ def fallback_market_rows(timestamp: datetime) -> list[tuple[Any, ...]]:
         (timestamp, name, price * 0.995, price * 1.01, price * 0.99, price, 1000000.0, cap)
         for name, price, cap in base
     ]
+
+
+def upsert_asset_registry(connection: Any, market_rows: Sequence[tuple[Any, ...]]) -> None:
+    asset_ids = sorted({str(row[1]) for row in market_rows if len(row) > 1 and row[1]})
+    if not asset_ids:
+        return
+    rows = [
+        (
+            asset_id,
+            f"{asset_id} Index",
+            "EQUITY_INDEX",
+            "INDIA",
+            "NSE",
+            True,
+        )
+        for asset_id in asset_ids
+    ]
+    with connection.cursor() as cursor:
+        cursor.executemany(
+            """
+            INSERT INTO asset_registry (
+                asset_id, asset_name, asset_class, region, data_provider, is_active
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (asset_id) DO NOTHING
+            """,
+            rows,
+        )
 
 
 def latest_components() -> list[ComponentSnapshot]:
