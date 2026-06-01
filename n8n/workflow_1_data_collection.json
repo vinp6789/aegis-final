@@ -23,7 +23,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_1_data_collection', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, freshness_seconds, missing_value_ratio, average_latency_ms, validation_success_rate, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_1_data_collection', 1.0, 0, 0.0, 0.0, 1.0, 100) ON CONFLICT DO NOTHING;"
       },
       "id": "log-start",
       "name": "Log Start UTC",
@@ -46,19 +46,12 @@
     },
     {
       "parameters": {
-        "url": "={{$env.AEGIS_NSE_ADAPTER_URL || 'http://aegis-ingestion:8000/adapters/nse/daily'}}",
-        "method": "GET",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "X-Aegis-Workflow",
-              "value": "workflow_1_data_collection"
-            }
-          ]
-        },
+        "url": "={{$env.AEGIS_WORKER_URL || 'https://aegis-worker-production.up.railway.app'}}/run/data-collection",
+        "method": "POST",
+        "sendBody": false,
+        "contentType": "json",
         "options": {
-          "timeout": 30000,
+          "timeout": 120000,
           "response": {
             "response": {
               "fullResponse": true
@@ -81,19 +74,12 @@
     },
     {
       "parameters": {
-        "url": "={{$env.AEGIS_RBI_ADAPTER_URL || 'http://aegis-ingestion:8000/adapters/rbi/liquidity'}}",
-        "method": "GET",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "X-Aegis-Workflow",
-              "value": "workflow_1_data_collection"
-            }
-          ]
-        },
+        "url": "={{$env.AEGIS_WORKER_URL || 'https://aegis-worker-production.up.railway.app'}}/run/data-collection",
+        "method": "POST",
+        "sendBody": false,
+        "contentType": "json",
         "options": {
-          "timeout": 30000,
+          "timeout": 120000,
           "response": {
             "response": {
               "fullResponse": true
@@ -116,19 +102,12 @@
     },
     {
       "parameters": {
-        "url": "={{$env.AEGIS_STABLECOIN_ADAPTER_URL || 'http://aegis-ingestion:8000/adapters/defillama/stablecoins'}}",
-        "method": "GET",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "X-Aegis-Workflow",
-              "value": "workflow_1_data_collection"
-            }
-          ]
-        },
+        "url": "={{$env.AEGIS_WORKER_URL || 'https://aegis-worker-production.up.railway.app'}}/run/data-collection",
+        "method": "POST",
+        "sendBody": false,
+        "contentType": "json",
         "options": {
-          "timeout": 30000,
+          "timeout": 120000,
           "response": {
             "response": {
               "fullResponse": true
@@ -151,13 +130,12 @@
     },
     {
       "parameters": {
-        "url": "={{$env.AEGIS_QUALITY_URL || 'http://aegis-ingestion:8000/data-quality/validate'}}",
-        "method": "POST",
-        "sendBody": true,
+        "url": "={{$env.AEGIS_WORKER_URL || 'https://aegis-worker-production.up.railway.app'}}/health",
+        "method": "GET",
+        "sendBody": false,
         "contentType": "json",
-        "jsonBody": "={\"timestamp\":\"{{$now.toUTC().toISO()}}\",\"workflow\":\"workflow_1_data_collection\",\"sources\":{\"nse\":{{$json}},\"rbi\":{{$json}},\"stablecoins\":{{$json}}}}",
         "options": {
-          "timeout": 45000,
+          "timeout": 120000,
           "response": {
             "response": {
               "fullResponse": true
@@ -201,7 +179,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO daily_market_metrics (timestamp, asset_id, open, high, low, close, volume, market_cap) SELECT NOW() AT TIME ZONE 'UTC', COALESCE(item->>'asset_id', 'UNKNOWN'), NULLIF(item->>'open','')::NUMERIC, NULLIF(item->>'high','')::NUMERIC, NULLIF(item->>'low','')::NUMERIC, NULLIF(item->>'close','')::NUMERIC, NULLIF(item->>'volume','')::NUMERIC, NULLIF(item->>'market_cap','')::NUMERIC FROM jsonb_array_elements(COALESCE(($json->'body'->'daily_market_metrics')::jsonb, '[]'::jsonb)) AS item ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_1_data_collection', 'save_market_metrics', 'DATA_COLLECTION_PERSISTED_BY_WORKER', CAST($json AS TEXT), 'LOW');"
       },
       "id": "save-market-metrics",
       "name": "Save Market Metrics",
@@ -225,7 +203,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO macro_liquidity_indicators (timestamp, indicator_code, value, release_date, source_name) SELECT NOW() AT TIME ZONE 'UTC', COALESCE(item->>'indicator_code', 'UNKNOWN'), NULLIF(item->>'value','')::NUMERIC, COALESCE(NULLIF(item->>'release_date','')::TIMESTAMPTZ, NOW() AT TIME ZONE 'UTC'), COALESCE(item->>'source_name','workflow_1_data_collection') FROM jsonb_array_elements(COALESCE(($json->'body'->'macro_liquidity_indicators')::jsonb, '[]'::jsonb)) AS item ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_1_data_collection', 'save_liquidity_indicators', 'DATA_COLLECTION_PERSISTED_BY_WORKER', CAST($json AS TEXT), 'LOW');"
       },
       "id": "save-liquidity-indicators",
       "name": "Save Liquidity Indicators",
@@ -249,7 +227,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO stablecoin_liquidity_growth (timestamp, token_symbol, circulating_supply, supply_growth_1d, supply_growth_7d) SELECT NOW() AT TIME ZONE 'UTC', COALESCE(item->>'token_symbol', 'UNKNOWN'), GREATEST(NULLIF(item->>'circulating_supply','')::NUMERIC, 0.00000001), NULLIF(item->>'supply_growth_1d','')::NUMERIC, NULLIF(item->>'supply_growth_7d','')::NUMERIC FROM jsonb_array_elements(COALESCE(($json->'body'->'stablecoin_liquidity_growth')::jsonb, '[]'::jsonb)) AS item ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_1_data_collection', 'save_stablecoins', 'DATA_COLLECTION_PERSISTED_BY_WORKER', CAST($json AS TEXT), 'LOW');"
       },
       "id": "save-stablecoins",
       "name": "Save Stablecoins",
@@ -297,7 +275,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_1_data_collection', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, freshness_seconds, missing_value_ratio, average_latency_ms, validation_success_rate, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_1_data_collection', 1.0, 0, 0.0, 0.0, 1.0, 100) ON CONFLICT DO NOTHING;"
       },
       "id": "log-success",
       "name": "Log Success UTC",

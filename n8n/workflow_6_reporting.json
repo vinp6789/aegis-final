@@ -24,7 +24,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_6_reporting', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, freshness_seconds, missing_value_ratio, average_latency_ms, validation_success_rate, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_6_reporting', 1.0, 0, 0.0, 0.0, 1.0, 100) ON CONFLICT DO NOTHING;"
       },
       "id": "log-start",
       "name": "Log Start UTC",
@@ -120,7 +120,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "SELECT source_name, source_health_score, freshness_minutes, timestamp AT TIME ZONE 'UTC' AS timestamp_utc FROM ingestion_source_health WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '24 hours' ORDER BY timestamp DESC LIMIT 50;"
+        "query": "SELECT indicator_code, source_health_score, freshness_seconds, timestamp AT TIME ZONE 'UTC' AS timestamp_utc FROM ingestion_source_health WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '24 hours' ORDER BY timestamp DESC LIMIT 50;"
       },
       "id": "fetch-data-health-summary",
       "name": "Fetch Data Health Summary",
@@ -187,13 +187,12 @@
     },
     {
       "parameters": {
-        "url": "={{$env.AEGIS_REPORT_WEBHOOK_URL || 'http://aegis-alert-router:8080/webhook/report'}}",
+        "url": "={{$env.AEGIS_WORKER_URL || 'https://aegis-worker-production.up.railway.app'}}/run/reporting",
         "method": "POST",
-        "sendBody": true,
+        "sendBody": false,
         "contentType": "json",
-        "jsonBody": "={\"timestamp\":\"{{$now.toUTC().toISO()}}\",\"workflow\":\"workflow_6_reporting\",\"channel\":\"webhook\",\"title\":\"Aegis Daily Forecast Summary\",\"payload\":{\"probability_report\":true,\"liquidity_breadth_summary\":true,\"scenario_summary\":true,\"historical_analog_summary\":true}}",
         "options": {
-          "timeout": 30000,
+          "timeout": 120000,
           "response": {
             "response": {
               "fullResponse": true
@@ -216,11 +215,11 @@
     },
     {
       "parameters": {
-        "url": "={{$env.AEGIS_TELEGRAM_WEBHOOK_URL || 'http://aegis-alert-router:8080/webhook/telegram'}}",
+        "url": "={{\"https://api.telegram.org/bot\" + $env.TELEGRAM_BOT_TOKEN + \"/sendMessage\"}}",
         "method": "POST",
         "sendBody": true,
         "contentType": "json",
-        "jsonBody": "={\"timestamp\":\"{{$now.toUTC().toISO()}}\",\"workflow\":\"workflow_6_reporting\",\"channel\":\"telegram\",\"message\":\"Aegis daily forecast summary prepared. Probability, liquidity, breadth, scenario, and analog sections are available.\"}",
+        "jsonBody": "={\"chat_id\":\"{{$env.TELEGRAM_CHAT_ID}}\",\"text\":\"{{$json.telegram_summary || $json.body?.telegram_summary || $json.message || 'Aegis workflow completed.'}}\"}",
         "options": {
           "timeout": 30000,
           "response": {
@@ -245,13 +244,12 @@
     },
     {
       "parameters": {
-        "url": "={{$env.AEGIS_EMAIL_WEBHOOK_URL || 'http://aegis-alert-router:8080/webhook/email'}}",
+        "url": "={{$env.AEGIS_WORKER_URL || 'https://aegis-worker-production.up.railway.app'}}/run/reporting",
         "method": "POST",
-        "sendBody": true,
+        "sendBody": false,
         "contentType": "json",
-        "jsonBody": "={\"timestamp\":\"{{$now.toUTC().toISO()}}\",\"workflow\":\"workflow_6_reporting\",\"channel\":\"email\",\"subject\":\"Aegis Daily Forecast Summary\",\"body\":\"Daily and weekly forecast summaries are ready with probability, liquidity, breadth, scenario, and historical analog sections.\"}",
         "options": {
-          "timeout": 30000,
+          "timeout": 120000,
           "response": {
             "response": {
               "fullResponse": true
@@ -275,7 +273,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_6_reporting', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, freshness_seconds, missing_value_ratio, average_latency_ms, validation_success_rate, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_6_reporting', 1.0, 0, 0.0, 0.0, 1.0, 100) ON CONFLICT DO NOTHING;"
       },
       "id": "log-success",
       "name": "Log Success UTC",

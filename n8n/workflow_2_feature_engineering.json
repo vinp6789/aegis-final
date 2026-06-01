@@ -24,7 +24,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_2_feature_engineering', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, freshness_seconds, missing_value_ratio, average_latency_ms, validation_success_rate, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_2_feature_engineering', 1.0, 0, 0.0, 0.0, 1.0, 100) ON CONFLICT DO NOTHING;"
       },
       "id": "log-start",
       "name": "Log Start UTC",
@@ -48,7 +48,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "SELECT asset_id, timestamp AT TIME ZONE 'UTC' AS timestamp_utc, COALESCE(close, 0.0) AS close, COALESCE(volume, 0.0) AS volume, COALESCE(market_cap, 0.0) AS market_cap FROM daily_market_metrics WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '3 days' ORDER BY timestamp DESC LIMIT 5000;"
+        "query": "SELECT asset_id, timestamp AT TIME ZONE 'UTC' AS timestamp_utc, COALESCE(close_price, 0.0) AS close_price, COALESCE(volume, 0.0) AS volume, COALESCE(market_cap, 0.0) AS market_cap FROM daily_market_metrics WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '3 days' ORDER BY timestamp DESC LIMIT 5000;"
       },
       "id": "pull-market-inputs",
       "name": "Pull Validated Market Inputs",
@@ -72,7 +72,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "SELECT indicator_code, timestamp AT TIME ZONE 'UTC' AS timestamp_utc, COALESCE(value, 0.0) AS value, COALESCE(source_name, 'unknown') AS source_name FROM macro_liquidity_indicators WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '7 days' ORDER BY timestamp DESC LIMIT 5000;"
+        "query": "SELECT indicator_code, timestamp AT TIME ZONE 'UTC' AS timestamp_utc, COALESCE(value, 0.0) AS value, COALESCE(indicator_code, 'unknown') AS indicator_code FROM macro_liquidity_indicators WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '7 days' ORDER BY timestamp DESC LIMIT 5000;"
       },
       "id": "pull-liquidity-inputs",
       "name": "Pull Validated Liquidity Inputs",
@@ -96,7 +96,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "SELECT token_symbol, timestamp AT TIME ZONE 'UTC' AS timestamp_utc, COALESCE(circulating_supply, 0.00000001) AS circulating_supply, COALESCE(supply_growth_1d, 0.0) AS supply_growth_1d, COALESCE(supply_growth_7d, 0.0) AS supply_growth_7d FROM stablecoin_liquidity_growth WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '7 days' ORDER BY timestamp DESC LIMIT 5000;"
+        "query": "SELECT token_symbol, timestamp AT TIME ZONE 'UTC' AS timestamp_utc, COALESCE(circulating_supply, 0.00000001) AS circulating_supply, COALESCE(daily_growth_pct, 0.0) AS daily_growth_pct, COALESCE(weekly_growth_pct, 0.0) AS weekly_growth_pct FROM stablecoin_liquidity_growth WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '7 days' ORDER BY timestamp DESC LIMIT 5000;"
       },
       "id": "pull-stablecoin-inputs",
       "name": "Pull Validated Stablecoin Inputs",
@@ -120,7 +120,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH recent AS (SELECT asset_id, timestamp, COALESCE(close, 0.0) AS close, COALESCE(volume, 0.0) AS volume, COALESCE(market_cap, 0.0) AS market_cap, LAG(close) OVER (PARTITION BY asset_id ORDER BY timestamp) AS previous_close FROM daily_market_metrics WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '90 days'), features AS (SELECT asset_id, MAX(timestamp) AS timestamp, AVG(CASE WHEN previous_close IS NULL OR previous_close = 0 THEN 0.0 ELSE (close - previous_close) / previous_close END) AS momentum_1d, AVG(volume) AS avg_volume, AVG(market_cap) AS avg_market_cap FROM recent GROUP BY asset_id) SELECT asset_id, timestamp AT TIME ZONE 'UTC' AS timestamp_utc, COALESCE(momentum_1d, 0.0) AS momentum_1d, COALESCE(avg_volume, 0.0) AS avg_volume, COALESCE(avg_market_cap, 0.0) AS avg_market_cap FROM features;"
+        "query": "WITH recent AS (SELECT asset_id, timestamp, COALESCE(close_price, 0.0) AS close_price, COALESCE(volume, 0.0) AS volume, COALESCE(market_cap, 0.0) AS market_cap, LAG(close_price) OVER (PARTITION BY asset_id ORDER BY timestamp) AS previous_close FROM daily_market_metrics WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '90 days'), features AS (SELECT asset_id, MAX(timestamp) AS timestamp, AVG(CASE WHEN previous_close IS NULL OR previous_close = 0 THEN 0.0 ELSE (close_price - previous_close) / previous_close END) AS momentum_1d, AVG(volume) AS avg_volume, AVG(market_cap) AS avg_market_cap FROM recent GROUP BY asset_id) SELECT asset_id, timestamp AT TIME ZONE 'UTC' AS timestamp_utc, COALESCE(momentum_1d, 0.0) AS momentum_1d, COALESCE(avg_volume, 0.0) AS avg_volume, COALESCE(avg_market_cap, 0.0) AS avg_market_cap FROM features;"
       },
       "id": "calculate-market-features",
       "name": "Calculate Market Features",
@@ -168,7 +168,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH recent AS (SELECT token_symbol, timestamp, COALESCE(circulating_supply, 0.00000001) AS circulating_supply, COALESCE(supply_growth_1d, 0.0) AS supply_growth_1d, COALESCE(supply_growth_7d, 0.0) AS supply_growth_7d FROM stablecoin_liquidity_growth WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '30 days') SELECT token_symbol, MAX(timestamp) AT TIME ZONE 'UTC' AS timestamp_utc, GREATEST(AVG(circulating_supply), 0.00000001) AS normalized_supply, COALESCE(AVG(supply_growth_1d), 0.0) AS growth_1d, COALESCE(AVG(supply_growth_7d), 0.0) AS growth_7d FROM recent GROUP BY token_symbol;"
+        "query": "WITH recent AS (SELECT token_symbol, timestamp, COALESCE(circulating_supply, 0.00000001) AS circulating_supply, COALESCE(daily_growth_pct, 0.0) AS daily_growth_pct, COALESCE(weekly_growth_pct, 0.0) AS weekly_growth_pct FROM stablecoin_liquidity_growth WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '30 days') SELECT token_symbol, MAX(timestamp) AT TIME ZONE 'UTC' AS timestamp_utc, GREATEST(AVG(circulating_supply), 0.00000001) AS normalized_supply, COALESCE(AVG(daily_growth_pct), 0.0) AS growth_1d, COALESCE(AVG(weekly_growth_pct), 0.0) AS growth_7d FROM recent GROUP BY token_symbol;"
       },
       "id": "normalize-stablecoin-features",
       "name": "Normalize Stablecoin Features",
@@ -192,7 +192,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "SELECT CASE WHEN COUNT(*) > 0 THEN TRUE ELSE FALSE END AS quality_ok FROM daily_market_metrics WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '3 days' AND close IS NOT NULL AND close >= 0.0;"
+        "query": "SELECT CASE WHEN COUNT(*) > 0 THEN TRUE ELSE FALSE END AS quality_ok FROM daily_market_metrics WHERE timestamp >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '3 days' AND close_price IS NOT NULL AND close_price >= 0.0;"
       },
       "id": "quality-check",
       "name": "Feature Quality Check",
@@ -236,7 +236,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO macro_liquidity_indicators (timestamp, indicator_code, value, release_date, source_name) SELECT NOW() AT TIME ZONE 'UTC', 'FEATURE_ENGINEERING_HEALTH', 100.0, NOW() AT TIME ZONE 'UTC', 'workflow_2_feature_engineering' ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO macro_liquidity_indicators (timestamp, indicator_code, value, revised, release_date) SELECT NOW() AT TIME ZONE 'UTC', 'FEATURE_ENGINEERING_HEALTH', 100.0, FALSE, NOW() AT TIME ZONE 'UTC' ON CONFLICT DO NOTHING;"
       },
       "id": "store-feature-output-marker",
       "name": "Store Feature Output Marker",
@@ -260,7 +260,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_2_feature_engineering', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, freshness_seconds, missing_value_ratio, average_latency_ms, validation_success_rate, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_2_feature_engineering', 1.0, 0, 0.0, 0.0, 1.0, 100) ON CONFLICT DO NOTHING;"
       },
       "id": "log-success",
       "name": "Log Success UTC",

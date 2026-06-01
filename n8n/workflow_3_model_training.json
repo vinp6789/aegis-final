@@ -24,7 +24,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_3_model_training', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, freshness_seconds, missing_value_ratio, average_latency_ms, validation_success_rate, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_3_model_training', 1.0, 0, 0.0, 0.0, 1.0, 100) ON CONFLICT DO NOTHING;"
       },
       "id": "log-start",
       "name": "Log Start UTC",
@@ -115,13 +115,23 @@
     },
     {
       "parameters": {
-        "command": "python -m analytics.validation.splitter",
-        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+        "url": "={{$env.AEGIS_WORKER_URL || 'https://aegis-worker-production.up.railway.app'}}/run/model-training",
+        "method": "POST",
+        "sendBody": false,
+        "contentType": "json",
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
       },
       "id": "run-walk-forward-validation",
       "name": "Run Walk Forward Validation",
-      "type": "n8n-nodes-base.executeCommand",
-      "typeVersion": 1,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
       "position": [
         1020,
         -220
@@ -130,17 +140,27 @@
       "maxTries": 2,
       "waitBetweenTries": 10000,
       "continueOnFail": true,
-      "notes": "Uses built-in Execute Command node to run local open-source validation jobs."
+      "notes": "Railway-compatible HTTP worker call replacing local Execute Command."
     },
     {
       "parameters": {
-        "command": "python -m analytics.validation.backtest_engine",
-        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+        "url": "={{$env.AEGIS_WORKER_URL || 'https://aegis-worker-production.up.railway.app'}}/run/model-training",
+        "method": "POST",
+        "sendBody": false,
+        "contentType": "json",
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
       },
       "id": "run-backtesting",
       "name": "Run Backtesting",
-      "type": "n8n-nodes-base.executeCommand",
-      "typeVersion": 1,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
       "position": [
         1020,
         -40
@@ -148,17 +168,28 @@
       "retryOnFail": true,
       "maxTries": 2,
       "waitBetweenTries": 10000,
-      "continueOnFail": true
+      "continueOnFail": true,
+      "notes": "Railway-compatible HTTP worker call replacing local Execute Command."
     },
     {
       "parameters": {
-        "command": "python -m analytics.validation.calibration",
-        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+        "url": "={{$env.AEGIS_WORKER_URL || 'https://aegis-worker-production.up.railway.app'}}/run/model-training",
+        "method": "POST",
+        "sendBody": false,
+        "contentType": "json",
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
       },
       "id": "run-probability-calibration",
       "name": "Run Probability Calibration",
-      "type": "n8n-nodes-base.executeCommand",
-      "typeVersion": 1,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
       "position": [
         1020,
         140
@@ -166,7 +197,8 @@
       "retryOnFail": true,
       "maxTries": 2,
       "waitBetweenTries": 10000,
-      "continueOnFail": true
+      "continueOnFail": true,
+      "notes": "Railway-compatible HTTP worker call replacing local Execute Command."
     },
     {
       "parameters": {
@@ -195,7 +227,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_3_model_training', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, freshness_seconds, missing_value_ratio, average_latency_ms, validation_success_rate, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_3_model_training', 1.0, 0, 0.0, 0.0, 1.0, 100) ON CONFLICT DO NOTHING;"
       },
       "id": "log-success",
       "name": "Log Success UTC",
@@ -219,7 +251,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_3_model_training', 1.0, 0, 1440, 100) ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, freshness_seconds, missing_value_ratio, average_latency_ms, validation_success_rate, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_3_model_training', 1.0, 86400, 0.0, 0.0, 1.0, 100) ON CONFLICT DO NOTHING;"
       },
       "id": "log-no-training-needed",
       "name": "Log No Training Needed",

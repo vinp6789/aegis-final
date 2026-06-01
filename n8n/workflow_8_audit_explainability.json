@@ -24,7 +24,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_8_audit_explainability', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, freshness_seconds, missing_value_ratio, average_latency_ms, validation_success_rate, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_8_audit_explainability', 1.0, 0, 0.0, 0.0, 1.0, 100) ON CONFLICT DO NOTHING;"
       },
       "id": "log-start",
       "name": "Log Start UTC",
@@ -115,13 +115,23 @@
     },
     {
       "parameters": {
-        "command": "python -c \"from datetime import datetime, timezone; from analytics.governance.explainability_engine import ExplainabilityEngine, FeatureVector; v=FeatureVector(timestamp=datetime.now(timezone.utc), target_scope='GLOBAL', features={'liquidity':60,'breadth':0.2,'crypto':55}, prediction_value=0.62, model_name='xgboost'); e=ExplainabilityEngine().explain_from_shap_values(v, base_value=0.40, shap_values={'liquidity':0.12,'breadth':0.08,'crypto':0.02}); assert e.additive_valid and e.additive_error <= 1e-5; print('EXPLAINABILITY_OK')\"",
-        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+        "url": "={{$env.AEGIS_WORKER_URL || 'https://aegis-worker-production.up.railway.app'}}/run/audit",
+        "method": "POST",
+        "sendBody": false,
+        "contentType": "json",
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
       },
       "id": "trigger-explainability-engine",
       "name": "Trigger Explainability Engine",
-      "type": "n8n-nodes-base.executeCommand",
-      "typeVersion": 1,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
       "position": [
         1020,
         -180
@@ -129,17 +139,28 @@
       "retryOnFail": true,
       "maxTries": 2,
       "waitBetweenTries": 10000,
-      "continueOnFail": true
+      "continueOnFail": true,
+      "notes": "Railway-compatible HTTP worker call replacing local Execute Command."
     },
     {
       "parameters": {
-        "command": "python -c \"from datetime import datetime, timezone; from analytics.governance.forecast_auditor import ForecastAuditor, ForecastRecord; rows=[ForecastRecord(timestamp=datetime.now(timezone.utc), target_scope='GLOBAL', forecast_type='systemic_stress', horizon_months=12, probability=0.2, realized_outcome=0)]; r=ForecastAuditor().audit(rows); assert 0 <= r.metrics.brier_score <= 1; assert 0 <= r.metrics.expected_calibration_error <= 1; print('AUDIT_OK')\"",
-        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+        "url": "={{$env.AEGIS_WORKER_URL || 'https://aegis-worker-production.up.railway.app'}}/run/audit",
+        "method": "POST",
+        "sendBody": false,
+        "contentType": "json",
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
       },
       "id": "generate-audit-logs",
       "name": "Generate Audit Logs",
-      "type": "n8n-nodes-base.executeCommand",
-      "typeVersion": 1,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
       "position": [
         1280,
         -180
@@ -147,17 +168,28 @@
       "retryOnFail": true,
       "maxTries": 2,
       "waitBetweenTries": 10000,
-      "continueOnFail": true
+      "continueOnFail": true,
+      "notes": "Railway-compatible HTTP worker call replacing local Execute Command."
     },
     {
       "parameters": {
-        "command": "python -c \"from datetime import datetime, timezone, timedelta; from analytics.governance.explainability_engine import ExplainabilityEngine, FeatureVector; engine=ExplainabilityEngine(); a=engine.explain_from_shap_values(FeatureVector(timestamp=datetime.now(timezone.utc)-timedelta(days=1), target_scope='GLOBAL', features={'liquidity':50,'breadth':0.0,'crypto':50}, prediction_value=0.50), base_value=0.30, shap_values={'liquidity':0.10,'breadth':0.05,'crypto':0.05}); b=engine.explain_from_shap_values(FeatureVector(timestamp=datetime.now(timezone.utc), target_scope='GLOBAL', features={'liquidity':40,'breadth':-0.2,'crypto':45}, prediction_value=0.66), base_value=0.30, shap_values={'liquidity':0.24,'breadth':0.07,'crypto':0.05}); d=engine.forecast_diff(a,b); assert d.top_driver_shifts; print('TRACEABILITY_OK')\"",
-        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+        "url": "={{$env.AEGIS_WORKER_URL || 'https://aegis-worker-production.up.railway.app'}}/run/audit",
+        "method": "POST",
+        "sendBody": false,
+        "contentType": "json",
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
       },
       "id": "generate-forecast-traceability",
       "name": "Generate Forecast Traceability",
-      "type": "n8n-nodes-base.executeCommand",
-      "typeVersion": 1,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
       "position": [
         1540,
         -180
@@ -165,7 +197,8 @@
       "retryOnFail": true,
       "maxTries": 2,
       "waitBetweenTries": 10000,
-      "continueOnFail": true
+      "continueOnFail": true,
+      "notes": "Railway-compatible HTTP worker call replacing local Execute Command."
     },
     {
       "parameters": {
@@ -190,7 +223,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_8_audit_explainability', 'audit_explainability_outputs', 'AUDIT_EXPLAINABILITY_OUTPUTS', jsonb_build_object('shap_style_contributions_generated', true, 'audit_logs_generated', true, 'forecast_traceability_report_generated', true, 'additive_explanation_conservation_verified', true, 'timestamp_utc', NOW() AT TIME ZONE 'UTC')::TEXT, 'LOW');"
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_8_audit_explainability', 'audit_explainability_outputs', 'AUDIT_PERSISTED_BY_WORKER', CAST($json AS TEXT), 'LOW');"
       },
       "id": "persist-audit-explainability-outputs",
       "name": "Persist Audit Explainability Outputs",
@@ -213,13 +246,12 @@
     },
     {
       "parameters": {
-        "url": "={{$env.AEGIS_AUDIT_ALERT_WEBHOOK_URL || 'http://aegis-alert-router:8080/webhook/audit'}}",
+        "url": "={{$env.AEGIS_WORKER_URL || 'https://aegis-worker-production.up.railway.app'}}/run/audit",
         "method": "POST",
-        "sendBody": true,
+        "sendBody": false,
         "contentType": "json",
-        "jsonBody": "={\"timestamp\":\"{{$now.toUTC().toISO()}}\",\"workflow\":\"workflow_8_audit_explainability\",\"alert_type\":\"audit_explainability_anomaly\",\"additive_conservation_checked\":true,\"traceability_report_generated\":true}",
         "options": {
-          "timeout": 30000,
+          "timeout": 120000,
           "response": {
             "response": {
               "fullResponse": true
@@ -243,7 +275,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_8_audit_explainability', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, freshness_seconds, missing_value_ratio, average_latency_ms, validation_success_rate, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_8_audit_explainability', 1.0, 0, 0.0, 0.0, 1.0, 100) ON CONFLICT DO NOTHING;"
       },
       "id": "log-success",
       "name": "Log Success UTC",

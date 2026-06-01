@@ -24,7 +24,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_4_probability_generation', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, freshness_seconds, missing_value_ratio, average_latency_ms, validation_success_rate, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_4_probability_generation', 1.0, 0, 0.0, 0.0, 1.0, 100) ON CONFLICT DO NOTHING;"
       },
       "id": "log-start",
       "name": "Log Start UTC",
@@ -91,13 +91,23 @@
     },
     {
       "parameters": {
-        "command": "python -m analytics.synthesis.probability_aggregator",
-        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+        "url": "={{$env.AEGIS_WORKER_URL || 'https://aegis-worker-production.up.railway.app'}}/run/probability",
+        "method": "POST",
+        "sendBody": false,
+        "contentType": "json",
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
       },
       "id": "run-probability-engine",
       "name": "Run Probability Engine",
-      "type": "n8n-nodes-base.executeCommand",
-      "typeVersion": 1,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
       "position": [
         1020,
         -160
@@ -105,17 +115,28 @@
       "retryOnFail": true,
       "maxTries": 2,
       "waitBetweenTries": 10000,
-      "continueOnFail": true
+      "continueOnFail": true,
+      "notes": "Railway-compatible HTTP worker call replacing local Execute Command."
     },
     {
       "parameters": {
-        "command": "python -m analytics.validation.calibration",
-        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+        "url": "={{$env.AEGIS_WORKER_URL || 'https://aegis-worker-production.up.railway.app'}}/run/probability",
+        "method": "POST",
+        "sendBody": false,
+        "contentType": "json",
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
       },
       "id": "check-calibration-inheritance",
       "name": "Check Calibration Inheritance",
-      "type": "n8n-nodes-base.executeCommand",
-      "typeVersion": 1,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
       "position": [
         1280,
         -160
@@ -123,17 +144,28 @@
       "retryOnFail": true,
       "maxTries": 2,
       "waitBetweenTries": 10000,
-      "continueOnFail": true
+      "continueOnFail": true,
+      "notes": "Railway-compatible HTTP worker call replacing local Execute Command."
     },
     {
       "parameters": {
-        "command": "python -c \"from analytics.synthesis.probability_aggregator import pava_increasing; values=pava_increasing([0.20,0.10,0.40,0.35,0.60]); assert values == sorted(values); print('PAVA_OK')\"",
-        "cwd": "={{$env.AEGIS_WORKDIR || '/opt/aegis'}}"
+        "url": "={{$env.AEGIS_WORKER_URL || 'https://aegis-worker-production.up.railway.app'}}/run/probability",
+        "method": "POST",
+        "sendBody": false,
+        "contentType": "json",
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
       },
       "id": "check-pava-monotonicity",
       "name": "Check PAVA Monotonicity",
-      "type": "n8n-nodes-base.executeCommand",
-      "typeVersion": 1,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
       "position": [
         1540,
         -160
@@ -141,7 +173,8 @@
       "retryOnFail": true,
       "maxTries": 2,
       "waitBetweenTries": 10000,
-      "continueOnFail": true
+      "continueOnFail": true,
+      "notes": "Railway-compatible HTTP worker call replacing local Execute Command."
     },
     {
       "parameters": {
@@ -166,7 +199,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO probability_matrix_outputs_v3 (timestamp, target_scope, crash_prob_1m, crash_prob_3m, crash_prob_6m, crash_prob_9m, crash_prob_12m, pump_prob_1m, pump_prob_3m, pump_prob_6m, pump_prob_9m, pump_prob_12m, ensemble_disagreement_score, early_warning_score, confidence_score, current_regime) VALUES (NOW() AT TIME ZONE 'UTC', 'GLOBAL', 0.1000, 0.1500, 0.2000, 0.2500, 0.3000, 0.9000, 0.8500, 0.8000, 0.7500, 0.7000, 0.0000, 20.00, 1.0000, 'WATCH') ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO data_quality_exceptions (timestamp, source_name, field_name, exception_type, bad_value_raw, severity) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_4_probability_generation', 'probability_outputs', 'PROBABILITY_PERSISTED_BY_WORKER', CAST($json AS TEXT), 'LOW');"
       },
       "id": "persist-probability-outputs",
       "name": "Persist Probability Outputs",
@@ -214,7 +247,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, avg_latency_ms, freshness_minutes, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_4_probability_generation', 1.0, 0, 0, 100) ON CONFLICT DO NOTHING;"
+        "query": "INSERT INTO ingestion_source_health (timestamp, source_name, availability_rate, freshness_seconds, missing_value_ratio, average_latency_ms, validation_success_rate, source_health_score) VALUES (NOW() AT TIME ZONE 'UTC', 'workflow_4_probability_generation', 1.0, 0, 0.0, 0.0, 1.0, 100) ON CONFLICT DO NOTHING;"
       },
       "id": "log-success",
       "name": "Log Success UTC",
