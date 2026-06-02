@@ -23,6 +23,7 @@ class ValuationSnapshot:
     def to_dict(self) -> dict[str, float | str]:
         return {
             "valuation_score": self.valuation_score,
+            "valuation_risk": self.valuation_risk_score,
             "valuation_risk_score": self.valuation_risk_score,
             "valuation_percentile": self.valuation_percentile,
             "valuation_validation_method": self.validation_method,

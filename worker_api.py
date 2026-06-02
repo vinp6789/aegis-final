@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
@@ -36,6 +38,7 @@ DECISION_OUTPUT_FIELDS = (
     "recovery_probability_12m",
     "recovery_probability_24m",
     "valuation_score",
+    "valuation_risk",
     "valuation_risk_score",
     "valuation_percentile",
     "regime_state",
@@ -58,10 +61,13 @@ DECISION_OUTPUT_FIELDS = (
     "expected_drawdown_error",
     "walk_forward_validation_method",
     "crisis_detection_rate",
+    "crisis_similarity_score",
+    "crisis_replay_score",
     "panic_false_positive_rate",
     "recovery_detection_rate",
     "drawdown_reduction_score",
     "signal_quality_score",
+    "crisis_lead_time_months",
     "panic_lead_time_months",
     "recovery_lead_time_months",
     "crisis_replay_validation_method",
@@ -97,12 +103,18 @@ CREDIT_INDICATOR_ALIASES = {
     "high_yield_spread": ("FRED_BAMLH0A0HYM2", "BAMLH0A0HYM2", "HIGH_YIELD_SPREAD", "HY_SPREAD"),
     "ted_spread": ("FRED_TEDRATE", "TEDRATE", "TED_SPREAD"),
     "commercial_paper_spread": ("FRED_DCPF3M", "DCPF3M", "COMMERCIAL_PAPER_SPREAD", "CP_SPREAD"),
+    "yield_curve": ("FRED_T10Y2Y", "T10Y2Y", "YIELD_CURVE_10Y2Y", "YIELD_CURVE"),
 }
 
 PRECIOUS_METALS_ASSET_ALIASES = {
     "gold": ("GOLD", "XAU", "XAUUSD", "GC=F", "MGC=F", "GLD"),
     "silver": ("SILVER", "XAG", "XAGUSD", "SI=F", "SIL=F", "SLV"),
     "dxy": ("DXY", "DX-Y.NYB", "US_DOLLAR_INDEX"),
+}
+
+CREDIT_ASSET_ALIASES = {
+    "high_yield_credit": ("HYG", "HIGH_YIELD_ETF"),
+    "investment_grade_credit": ("LQD", "INVESTMENT_GRADE_ETF"),
 }
 
 MACRO_PRESSURE_ALIASES = {
@@ -120,6 +132,99 @@ VALUATION_INDICATOR_ALIASES = {
     "dividend_yield": ("DIVIDEND_YIELD", "SP500_DIVIDEND_YIELD", "NIFTY_DIVIDEND_YIELD"),
     "market_cap_to_gdp": ("MARKET_CAP_TO_GDP", "BUFFETT_INDICATOR", "WILSHIRE_GDP"),
 }
+
+FRED_MACRO_SERIES = (
+    ("T10YIE", "FRED_T10YIE"),
+    ("DFII10", "FRED_DFII10"),
+    ("DTWEXBGS", "FRED_DTWEGS"),
+    ("BAA", "FRED_BAA"),
+    ("AAA", "FRED_AAA"),
+    ("BAMLH0A0HYM2", "FRED_BAMLH0A0HYM2"),
+    ("TEDRATE", "FRED_TEDRATE"),
+    ("DCPF3M", "FRED_DCPF3M"),
+    ("T10Y2Y", "FRED_T10Y2Y"),
+)
+
+MULTPL_VALUATION_SERIES = (
+    ("shiller-pe", "SHILLER_CAPE"),
+    ("s-p-500-earnings-yield", "SP500_EARNINGS_YIELD"),
+    ("s-p-500-dividend-yield", "SP500_DIVIDEND_YIELD"),
+)
+
+CRISIS_ANALOG_TEMPLATES = (
+    {
+        "name": "1929 Great Crash",
+        "start": "1929-09-01",
+        "lead_time": 5.0,
+        "features": {
+            "liquidity_stress": 0.62,
+            "credit_stress": 0.76,
+            "valuation_risk": 0.92,
+            "breadth_stress": 0.78,
+            "panic": 0.88,
+        },
+    },
+    {
+        "name": "1973 Inflation Shock",
+        "start": "1973-01-01",
+        "lead_time": 4.0,
+        "features": {
+            "liquidity_stress": 0.72,
+            "credit_stress": 0.64,
+            "valuation_risk": 0.66,
+            "breadth_stress": 0.68,
+            "panic": 0.74,
+        },
+    },
+    {
+        "name": "1987 Crash",
+        "start": "1987-08-01",
+        "lead_time": 2.0,
+        "features": {
+            "liquidity_stress": 0.52,
+            "credit_stress": 0.46,
+            "valuation_risk": 0.82,
+            "breadth_stress": 0.74,
+            "panic": 0.80,
+        },
+    },
+    {
+        "name": "2000 Dotcom Crash",
+        "start": "2000-03-01",
+        "lead_time": 7.0,
+        "features": {
+            "liquidity_stress": 0.55,
+            "credit_stress": 0.58,
+            "valuation_risk": 0.98,
+            "breadth_stress": 0.70,
+            "panic": 0.82,
+        },
+    },
+    {
+        "name": "2008 Global Financial Crisis",
+        "start": "2007-10-01",
+        "lead_time": 9.0,
+        "features": {
+            "liquidity_stress": 0.86,
+            "credit_stress": 0.96,
+            "valuation_risk": 0.72,
+            "breadth_stress": 0.82,
+            "panic": 0.94,
+        },
+    },
+    {
+        "name": "2020 Pandemic Shock",
+        "start": "2020-02-01",
+        "lead_time": 1.0,
+        "features": {
+            "liquidity_stress": 0.50,
+            "credit_stress": 0.82,
+            "valuation_risk": 0.76,
+            "breadth_stress": 0.90,
+            "panic": 0.92,
+        },
+    },
+)
 
 
 @app.get("/health")
@@ -556,6 +661,8 @@ def fetch_precious_metals_rows(timestamp: datetime) -> tuple[list[tuple[Any, ...
         ("GC=F", "GOLD"),
         ("SI=F", "SILVER"),
         ("DX-Y.NYB", "DXY"),
+        ("HYG", "HYG"),
+        ("LQD", "LQD"),
     ]
     rows = []
     active_count = 0
@@ -610,20 +717,32 @@ def fallback_precious_market_row(timestamp: datetime, asset_id: str) -> tuple[An
 
 
 def fetch_precious_macro_rows(timestamp: datetime) -> tuple[list[tuple[str, float]], str]:
-    series = [
-        ("T10YIE", "FRED_T10YIE"),
-        ("DFII10", "FRED_DFII10"),
-        ("DTWEXBGS", "FRED_DTWEGS"),
-    ]
     rows = []
     active_count = 0
-    for series_id, indicator_code in series:
+    fred_failures = 0
+    for series_id, indicator_code in FRED_MACRO_SERIES:
         value = fetch_fred_csv_latest(series_id)
+        if value is None:
+            fred_failures += 1
+            if fred_failures >= 2 and not rows:
+                break
+            continue
+        fred_failures = 0
+        rows.append((indicator_code, value))
+        active_count += 1
+    for slug, indicator_code in MULTPL_VALUATION_SERIES:
+        value = fetch_multpl_latest(slug)
         if value is None:
             continue
         rows.append((indicator_code, value))
         active_count += 1
-    status = "ACTIVE" if active_count == len(series) else "PARTIAL" if active_count else "UNAVAILABLE"
+    total_sources = len(FRED_MACRO_SERIES) + len(MULTPL_VALUATION_SERIES)
+    market_cap_to_gdp = estimate_market_cap_to_gdp()
+    if market_cap_to_gdp is not None:
+        rows.append(("MARKET_CAP_TO_GDP", market_cap_to_gdp))
+        active_count += 1
+        total_sources += 1
+    status = "ACTIVE" if active_count == total_sources else "PARTIAL" if active_count else "UNAVAILABLE"
     return rows, status
 
 
@@ -631,7 +750,7 @@ def fetch_fred_csv_latest(series_id: str) -> float | None:
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={urllib.parse.quote(series_id, safe='')}"
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(request, timeout=5) as response:
             raw = response.read().decode("utf-8")
         for line in reversed(raw.strip().splitlines()[1:]):
             parts = line.split(",")
@@ -643,34 +762,155 @@ def fetch_fred_csv_latest(series_id: str) -> float | None:
     return None
 
 
-def fetch_stablecoin_rows(timestamp: datetime) -> tuple[list[tuple[Any, ...]], str]:
+def fetch_multpl_latest(slug: str) -> float | None:
+    url = f"https://www.multpl.com/{urllib.parse.quote(slug, safe='')}/table/by-month"
     try:
-        payload = fetch_json("https://stablecoins.llama.fi/stablecoincharts/all")
-        rows = payload if isinstance(payload, list) else payload.get("peggedAssets", [])
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(request, timeout=15) as response:
+            raw = response.read().decode("utf-8", errors="ignore")
+        for row in re.findall(r"<tr[^>]*>(.*?)</tr>", raw, flags=re.IGNORECASE | re.DOTALL):
+            cells = re.findall(r"<td[^>]*>(.*?)</td>", row, flags=re.IGNORECASE | re.DOTALL)
+            if len(cells) < 2:
+                continue
+            value = numeric_from_html(cells[1])
+            if value is not None:
+                return value
+    except Exception:
+        return None
+    return None
+
+
+def numeric_from_html(fragment: str) -> float | None:
+    text = re.sub(r"<[^>]+>", " ", fragment)
+    text = re.sub(r"&[#A-Za-z0-9]+;", " ", text)
+    text = (
+        text.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("%", "")
+        .replace(",", "")
+        .strip()
+    )
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def estimate_market_cap_to_gdp() -> float | None:
+    wilshire = fetch_fred_csv_latest("WILL5000INDFC")
+    gdp = fetch_fred_csv_latest("GDP")
+    if wilshire is None or gdp is None or gdp <= 0.0:
+        return None
+    return bounded(wilshire / gdp * 100.0, 0.0, 300.0)
+
+
+def fetch_stablecoin_rows(timestamp: datetime) -> tuple[list[tuple[Any, ...]], str]:
+    rows = fetch_stablecoin_assets_rows(timestamp)
+    if rows:
+        return rows, "ACTIVE"
+    rows = fetch_stablecoin_chart_rows(timestamp)
+    if rows:
+        return rows, "PARTIAL"
+    return fallback_stablecoin_rows(timestamp), "FALLBACK"
+
+
+def fetch_stablecoin_assets_rows(timestamp: datetime) -> list[tuple[Any, ...]]:
+    try:
+        payload = fetch_json("https://stablecoins.llama.fi/stablecoins?includePrices=true")
+        rows = payload.get("peggedAssets", []) if isinstance(payload, dict) else []
         output = []
-        for row in rows[:5]:
+        for row in rows:
             if not isinstance(row, dict):
                 continue
-            supply = row.get("totalCirculatingUSD")
-            circulating = row.get("circulating")
-            if supply is None and isinstance(circulating, dict):
-                supply = circulating.get("peggedUSD")
-            supply = float(supply or row.get("circulating_supply") or 1.0)
+            symbol = str(row.get("symbol") or row.get("name") or "").upper()
+            if symbol not in {"USDT", "USDC", "DAI", "USDE", "FDUSD"}:
+                continue
+            supply = stablecoin_number(
+                row.get("circulating")
+                or row.get("circulatingPrevDay")
+                or row.get("circulatingPrevWeek")
+                or row.get("circulatingPrevMonth")
+                or row.get("mcap")
+            )
+            if supply is None or supply <= 0.0:
+                continue
+            previous_day = stablecoin_number(row.get("circulatingPrevDay"))
+            previous_week = stablecoin_number(row.get("circulatingPrevWeek"))
+            previous_month = stablecoin_number(row.get("circulatingPrevMonth"))
             output.append(
                 (
                     timestamp,
-                    str(row.get("symbol") or row.get("name") or "STABLE"),
+                    symbol,
                     max(supply, 1.0),
-                    float(row.get("change_1d") or 0.0),
-                    float(row.get("change_7d") or 0.0),
-                    float(row.get("change_30d") or 0.0),
+                    pct_change(supply, previous_day),
+                    pct_change(supply, previous_week),
+                    pct_change(supply, previous_month),
                 )
             )
+            if len(output) >= 5:
+                break
         if output:
-            return output, "ACTIVE"
+            return output
     except Exception:
-        pass
-    return [(timestamp, "USDT", 100000000000.0, 0.0, 0.0, 0.0), (timestamp, "USDC", 30000000000.0, 0.0, 0.0, 0.0)], "FALLBACK"
+        return []
+    return []
+
+
+def fetch_stablecoin_chart_rows(timestamp: datetime) -> list[tuple[Any, ...]]:
+    try:
+        payload = fetch_json("https://stablecoins.llama.fi/stablecoincharts/all")
+        rows = payload if isinstance(payload, list) else []
+        if not rows:
+            return []
+        latest = rows[-1]
+        previous_day = rows[-2] if len(rows) > 1 else {}
+        previous_week = rows[-8] if len(rows) > 7 else {}
+        previous_month = rows[-31] if len(rows) > 30 else {}
+        latest_supply = stablecoin_number(latest.get("totalCirculatingUSD"))
+        if latest_supply is None or latest_supply <= 0.0:
+            return []
+        return [
+            (
+                timestamp,
+                "STABLECOIN_TOTAL",
+                latest_supply,
+                pct_change(latest_supply, stablecoin_number(previous_day.get("totalCirculatingUSD"))),
+                pct_change(latest_supply, stablecoin_number(previous_week.get("totalCirculatingUSD"))),
+                pct_change(latest_supply, stablecoin_number(previous_month.get("totalCirculatingUSD"))),
+            )
+        ]
+    except Exception:
+        return []
+
+
+def fallback_stablecoin_rows(timestamp: datetime) -> list[tuple[Any, ...]]:
+    return [
+        (timestamp, "USDT", 100000000000.0, 0.0, 0.0, 0.0),
+        (timestamp, "USDC", 30000000000.0, 0.0, 0.0, 0.0),
+    ]
+
+
+def stablecoin_number(value: Any) -> float | None:
+    if isinstance(value, dict):
+        for key in ("peggedUSD", "usd", "value"):
+            parsed = stablecoin_number(value.get(key))
+            if parsed is not None:
+                return parsed
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed == parsed else None
+
+
+def pct_change(current: float, previous: float | None) -> float:
+    if previous is None or previous <= 0.0:
+        return 0.0
+    return round((current - previous) / previous * 100.0, 6)
 
 
 def fetch_json(url: str, *, headers: dict[str, str] | None = None) -> Any:
@@ -818,16 +1058,23 @@ def calculate_credit_stress_index() -> float:
     high_yield_spread = latest_macro_any(CREDIT_INDICATOR_ALIASES["high_yield_spread"])
     ted_spread = latest_macro_any(CREDIT_INDICATOR_ALIASES["ted_spread"])
     commercial_paper_spread = latest_macro_any(CREDIT_INDICATOR_ALIASES["commercial_paper_spread"])
+    yield_curve = latest_macro_any(CREDIT_INDICATOR_ALIASES["yield_curve"])
     components: list[tuple[float, float]] = []
 
     if baa_yield is not None and aaa_yield is not None:
-        components.append((normalize_spread(max(0.0, baa_yield - aaa_yield), low=0.50, high=3.00), 0.30))
+        components.append((normalize_spread(max(0.0, baa_yield - aaa_yield), low=0.50, high=3.00), 0.28))
     if high_yield_spread is not None:
-        components.append((normalize_spread(high_yield_spread, low=2.00, high=10.00), 0.30))
+        components.append((normalize_spread(high_yield_spread, low=2.00, high=10.00), 0.28))
     if ted_spread is not None:
-        components.append((normalize_spread(ted_spread, low=0.10, high=2.00), 0.20))
+        components.append((normalize_spread(ted_spread, low=0.10, high=2.00), 0.16))
     if commercial_paper_spread is not None:
-        components.append((normalize_spread(commercial_paper_spread, low=0.05, high=1.50), 0.20))
+        components.append((normalize_spread(commercial_paper_spread, low=0.05, high=1.50), 0.14))
+    if yield_curve is not None:
+        inversion_stress = normalize_spread(0.0 - yield_curve, low=-1.00, high=1.50)
+        components.append((inversion_stress, 0.14))
+    credit_etf_stress = credit_etf_stress_proxy()
+    if credit_etf_stress is not None:
+        components.append((credit_etf_stress, 0.25 if not components else 0.12))
 
     if components:
         weighted_total = sum(value * weight for value, weight in components)
@@ -837,6 +1084,15 @@ def calculate_credit_stress_index() -> float:
     macro_proxy = 100.0 - latest_macro_value("GLOBAL_LIQUIDITY_INDEX", 55.0)
     liquidity_proxy = 100.0 - latest_macro_value("FED_BALANCE_SHEET", 55.0)
     return round(bounded(macro_proxy * 0.65 + liquidity_proxy * 0.35, 0.0, 100.0), 6)
+
+
+def credit_etf_stress_proxy() -> float | None:
+    high_yield = latest_asset_price_any(CREDIT_ASSET_ALIASES["high_yield_credit"])
+    investment_grade = latest_asset_price_any(CREDIT_ASSET_ALIASES["investment_grade_credit"])
+    if high_yield is None or investment_grade is None or investment_grade <= 0.0:
+        return None
+    ratio = high_yield / investment_grade
+    return round(100.0 - normalize_spread(ratio, low=0.65, high=0.90), 6)
 
 
 def calculate_gold_silver_ratio() -> float:
@@ -1197,13 +1453,29 @@ def apply_walk_forward_confidence(matrix: ProbabilityMatrix, metrics: dict[str, 
 
 
 def calculate_crisis_replay_metrics() -> dict[str, float | str]:
+    analog_metrics = current_crisis_analog_metrics()
     try:
         with db_connection() as connection:
             ensure_runtime_tables(connection)
             observations = crisis_replay_observations(connection)
-        return CrisisReplayEngine().replay(observations).to_dict()
+        replay = CrisisReplayEngine().replay(observations).to_dict()
+        if str(replay.get("crisis_replay_validation_method", "")).startswith("Neutral bootstrap"):
+            replay.update(analog_metrics)
+        else:
+            replay["crisis_similarity_score"] = analog_metrics["crisis_similarity_score"]
+            replay["crisis_lead_time_months"] = analog_metrics["crisis_lead_time_months"]
+            replay["crisis_replay_score"] = round(
+                bounded(
+                    read_float(replay.get("signal_quality_score"), 50.0) * 0.65
+                    + read_float(analog_metrics["crisis_replay_score"], 50.0) * 0.35,
+                    0.0,
+                    100.0,
+                ),
+                6,
+            )
+        return replay
     except Exception:
-        return neutral_crisis_replay_metrics()
+        return analog_metrics
 
 
 def neutral_crisis_replay_metrics() -> dict[str, float | str]:
@@ -1219,8 +1491,72 @@ def neutral_crisis_replay_metrics() -> dict[str, float | str]:
     }
 
 
+def current_crisis_analog_metrics() -> dict[str, float | str]:
+    current = current_crisis_feature_vector()
+    scored = []
+    for template in CRISIS_ANALOG_TEMPLATES:
+        features = template["features"]
+        distance = math.sqrt(
+            sum(
+                (current[key] - float(features[key])) ** 2
+                for key in ("liquidity_stress", "credit_stress", "valuation_risk", "breadth_stress", "panic")
+            )
+            / 5.0
+        )
+        similarity = bounded((1.0 - distance) * 100.0, 0.0, 100.0)
+        scored.append((similarity, template))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_similarity, best_template = scored[0]
+    top_three = scored[:3]
+    weighted_lead = sum(score * float(template["lead_time"]) for score, template in top_three)
+    score_total = sum(score for score, _template in top_three) or 1.0
+    replay_score = bounded(
+        best_similarity * 0.60
+        + current["panic"] * 100.0 * 0.25
+        + current["credit_stress"] * 100.0 * 0.15,
+        0.0,
+        100.0,
+    )
+    method = (
+        "Current-state crisis analog replay against 1929, 1973, 1987, 2000, 2008, and 2020 templates; "
+        f"closest analog: {best_template['name']}."
+    )
+    return {
+        "crisis_detection_rate": round(replay_score, 6),
+        "crisis_similarity_score": round(best_similarity, 6),
+        "crisis_replay_score": round(replay_score, 6),
+        "panic_false_positive_rate": round(bounded((100.0 - best_similarity) * 0.25, 0.0, 100.0), 6),
+        "recovery_detection_rate": round(bounded((100.0 - replay_score) * 0.45 + 35.0, 0.0, 100.0), 6),
+        "drawdown_reduction_score": round(bounded(replay_score * 0.55 + current["breadth_stress"] * 45.0, 0.0, 100.0), 6),
+        "signal_quality_score": round(bounded(best_similarity * 0.50 + replay_score * 0.50, 0.0, 100.0), 6),
+        "crisis_lead_time_months": round(weighted_lead / score_total, 6),
+        "panic_lead_time_months": round(weighted_lead / score_total, 6),
+        "recovery_lead_time_months": round(max(1.0, 12.0 - weighted_lead / score_total), 6),
+        "crisis_replay_validation_method": method,
+    }
+
+
+def current_crisis_feature_vector() -> dict[str, float]:
+    latest_breadth = latest_breadth_row()
+    valuation = calculate_valuation_outputs()
+    credit = calculate_credit_stress_index()
+    liquidity = latest_macro_value("GLOBAL_LIQUIDITY_INDEX", 55.0)
+    previous_systemic = latest_systemic_stress()
+    panic = previous_systemic if previous_systemic is not None else 0.45
+    breadth = bounded(float(latest_breadth.get("leading_diffusion_index", 0.05)), -1.0, 1.0)
+    concentration = bounded(float(latest_breadth.get("hhi_concentration_score", 0.30)), 0.0, 1.0)
+    breadth_stress = bounded((1.0 - ((breadth + 1.0) / 2.0)) * 0.70 + concentration * 0.30, 0.0, 1.0)
+    return {
+        "liquidity_stress": bounded((100.0 - liquidity) / 100.0, 0.0, 1.0),
+        "credit_stress": bounded(credit / 100.0, 0.0, 1.0),
+        "valuation_risk": bounded(read_float(valuation.get("valuation_risk_score"), 50.0) / 100.0, 0.0, 1.0),
+        "breadth_stress": breadth_stress,
+        "panic": bounded(panic, 0.0, 1.0),
+    }
+
+
 def apply_crisis_replay_confidence(matrix: ProbabilityMatrix, metrics: dict[str, float | str]) -> ProbabilityMatrix:
-    quality = read_float(metrics.get("signal_quality_score"), 50.0)
+    quality = read_float(metrics.get("crisis_replay_score", metrics.get("signal_quality_score")), 50.0)
     detection = read_float(metrics.get("crisis_detection_rate"), 50.0)
     false_positive = read_float(metrics.get("panic_false_positive_rate"), 0.0)
     performance = bounded(quality * 0.45 + detection * 0.45 + (100.0 - false_positive) * 0.10, 0.0, 100.0)
@@ -2014,6 +2350,7 @@ def format_telegram_summary(
         f"WF Accuracy 3M/6M/12M: {walk_forward_metrics['forecast_accuracy_3m']}/{walk_forward_metrics['forecast_accuracy_6m']}/{walk_forward_metrics['forecast_accuracy_12m']}\n"
         f"Buy/Sell Hit Rate: {walk_forward_metrics['buy_signal_success_rate']}/{walk_forward_metrics['sell_signal_success_rate']}\n"
         f"Crisis Replay Det/Rec/Quality: {crisis_replay_metrics['crisis_detection_rate']}/{crisis_replay_metrics['recovery_detection_rate']}/{crisis_replay_metrics['signal_quality_score']}\n"
+        f"Crisis Similarity/Replay: {crisis_replay_metrics['crisis_similarity_score']}/{crisis_replay_metrics['crisis_replay_score']}\n"
         f"Crisis Lead Panic/Recovery: {crisis_replay_metrics['panic_lead_time_months']}m/{crisis_replay_metrics['recovery_lead_time_months']}m\n"
         f"Gold Bull/Bear: {precious_metals['gold_bull_probability']}/{precious_metals['gold_bear_probability']}\n"
         f"Gold Buy/Hold/Sell: {precious_metals['gold_buy_score']}/{precious_metals['gold_hold_score']}/{precious_metals['gold_sell_score']}\n"

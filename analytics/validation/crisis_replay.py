@@ -31,10 +31,13 @@ class ReplayObservation:
 @dataclass(frozen=True)
 class CrisisReplayResult:
     crisis_detection_rate: float
+    crisis_similarity_score: float
+    crisis_replay_score: float
     panic_false_positive_rate: float
     recovery_detection_rate: float
     drawdown_reduction_score: float
     signal_quality_score: float
+    crisis_lead_time_months: float
     panic_lead_time_months: float
     recovery_lead_time_months: float
     validation_method: str
@@ -42,10 +45,13 @@ class CrisisReplayResult:
     def to_dict(self) -> dict[str, float | str]:
         return {
             "crisis_detection_rate": self.crisis_detection_rate,
+            "crisis_similarity_score": self.crisis_similarity_score,
+            "crisis_replay_score": self.crisis_replay_score,
             "panic_false_positive_rate": self.panic_false_positive_rate,
             "recovery_detection_rate": self.recovery_detection_rate,
             "drawdown_reduction_score": self.drawdown_reduction_score,
             "signal_quality_score": self.signal_quality_score,
+            "crisis_lead_time_months": self.crisis_lead_time_months,
             "panic_lead_time_months": self.panic_lead_time_months,
             "recovery_lead_time_months": self.recovery_lead_time_months,
             "crisis_replay_validation_method": self.validation_method,
@@ -53,11 +59,12 @@ class CrisisReplayResult:
 
 
 CRISIS_LIBRARY = (
+    CrisisPeriod("1929 Great Crash", date(1929, 9, 1), date(1932, 7, 31)),
+    CrisisPeriod("1973 Inflation Shock", date(1973, 1, 1), date(1974, 12, 31)),
+    CrisisPeriod("1987 Crash", date(1987, 8, 1), date(1987, 12, 31)),
     CrisisPeriod("2000-2002 Dotcom Crash", date(2000, 3, 1), date(2002, 10, 31)),
     CrisisPeriod("2007-2009 Global Financial Crisis", date(2007, 10, 1), date(2009, 3, 31)),
-    CrisisPeriod("2011 Euro Debt / Risk Event", date(2011, 7, 1), date(2011, 10, 31)),
     CrisisPeriod("2020 Pandemic Shock", date(2020, 2, 1), date(2020, 4, 30)),
-    CrisisPeriod("2022 Inflation / Liquidity Shock", date(2022, 1, 1), date(2022, 10, 31)),
 )
 
 
@@ -97,14 +104,17 @@ class CrisisReplayEngine:
 
         return CrisisReplayResult(
             crisis_detection_rate=percent(detection_scores, neutral=50.0),
+            crisis_similarity_score=percent(detection_scores, neutral=50.0),
+            crisis_replay_score=percent(signal_quality_scores, neutral=50.0),
             panic_false_positive_rate=percent(false_positive_scores, neutral=0.0),
             recovery_detection_rate=percent(recovery_scores, neutral=50.0),
             drawdown_reduction_score=percent(drawdown_scores, neutral=50.0),
             signal_quality_score=percent(signal_quality_scores, neutral=50.0),
+            crisis_lead_time_months=round(mean_or_default([value for value in panic_leads if value is not None], 0.0), 6),
             panic_lead_time_months=round(mean_or_default([value for value in panic_leads if value is not None], 0.0), 6),
             recovery_lead_time_months=round(mean_or_default([value for value in recovery_leads if value is not None], 0.0), 6),
             validation_method=(
-                "Replays stored Aegis forecast_history snapshots across Dotcom, GFC, 2011, 2020, and 2022 crisis windows; "
+                "Replays stored Aegis forecast_history snapshots across 1929, 1973, 1987, 2000, 2008, and 2020 crisis windows; "
                 "uses existing daily_market_metrics realized returns/drawdowns when available."
             ),
         )
@@ -113,10 +123,13 @@ class CrisisReplayEngine:
 def neutral_result(method: str) -> CrisisReplayResult:
     return CrisisReplayResult(
         crisis_detection_rate=50.0,
+        crisis_similarity_score=50.0,
+        crisis_replay_score=50.0,
         panic_false_positive_rate=0.0,
         recovery_detection_rate=50.0,
         drawdown_reduction_score=50.0,
         signal_quality_score=50.0,
+        crisis_lead_time_months=0.0,
         panic_lead_time_months=0.0,
         recovery_lead_time_months=0.0,
         validation_method=method,
