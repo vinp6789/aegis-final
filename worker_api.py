@@ -29,6 +29,16 @@ from analytics.synthesis.precious_metals_regime import PreciousMetalsInput, Prec
 from analytics.synthesis.scenario_engine import ScenarioRun, ScenarioEngine
 from analytics.synthesis.valuation_layer import ValuationEngine, ValuationInput
 from analytics.validation.crisis_replay import CRISIS_LIBRARY, CrisisReplayEngine, ReplayObservation
+from analytics.validation.model_validation import (
+    ForecastValidationSample,
+    backtest_classification_metrics,
+    calculate_validation_scores,
+    conservative_probability,
+    conservative_score,
+    historical_validation_summary,
+    model_inventory,
+    validation_status_lists,
+)
 
 
 app = FastAPI(title="Aegis Worker", version="1.1.0")
@@ -95,6 +105,32 @@ DECISION_OUTPUT_FIELDS = (
     "silver_relative_value_score",
     "historical_precious_metal_analogs",
     "validation_method",
+    "pipeline_health",
+    "data_completeness",
+    "model_confidence",
+    "forecast_maturity",
+    "historical_validation_coverage",
+    "signal_quality",
+    "forecast_reliability",
+    "forecast_reliability_method",
+    "brier_score",
+    "precision",
+    "recall",
+    "roc_auc",
+    "calibration_error",
+    "f1_score",
+    "prediction_lead_time",
+    "false_positive_rate",
+    "false_negative_rate",
+    "maximum_drawdown_avoided",
+    "validated_models",
+    "calibrated_models",
+    "unvalidated_models",
+    "overconfident_models",
+    "historical_accuracy_summary",
+    "model_inventory",
+    "top_5_drivers",
+    "major_warnings",
 )
 
 CREDIT_INDICATOR_ALIASES = {
@@ -397,12 +433,21 @@ def run_probability() -> dict[str, Any]:
     matrix = apply_valuation_overlay(matrix, valuation)
     matrix = apply_walk_forward_confidence(matrix, walk_forward_metrics)
     matrix = apply_crisis_replay_confidence(matrix, crisis_replay_metrics)
+    validation_metrics = calculate_model_validation_metrics(
+        model_confidence=matrix.confidence_score,
+        walk_forward_metrics=walk_forward_metrics,
+        crisis_replay_metrics=crisis_replay_metrics,
+    )
+    matrix = apply_maturity_calibration(matrix, validation_metrics)
     decision = decision_outputs_from_matrix(matrix, credit_stress_index=credit_stress_index, valuation=valuation)
     hmm_regime = calculate_hmm_regime_outputs(matrix=matrix, decision=decision, credit_stress_index=credit_stress_index, valuation=valuation)
+    hmm_regime = calibrate_hmm_regime(hmm_regime, validation_metrics)
     decision = apply_hmm_regime_to_decision(decision, hmm_regime)
+    decision = calibrate_decision_outputs(decision, validation_metrics)
     matrix = apply_hmm_regime_confidence(matrix, hmm_regime)
     precious_metals = precious_metals_outputs_from_matrix(matrix, credit_stress_index=credit_stress_index, valuation=valuation)
     precious_metals = apply_hmm_regime_to_precious_metals(precious_metals, hmm_regime)
+    precious_metals = calibrate_precious_metals(precious_metals, validation_metrics)
     response = {
         "status": "ok",
         "timestamp_utc": matrix.timestamp.isoformat(),
@@ -416,6 +461,7 @@ def run_probability() -> dict[str, Any]:
         **walk_forward_metrics,
         **crisis_replay_metrics,
         **precious_metals,
+        **validation_metrics,
     }
     with db_connection() as connection:
         ensure_runtime_tables(connection)
@@ -461,10 +507,18 @@ def run_reporting() -> dict[str, Any]:
     crisis_replay_metrics = calculate_crisis_replay_metrics()
     decision = decision_outputs_from_row(latest, credit_stress_index=credit_stress_index, valuation=valuation)
     hmm_regime = calculate_hmm_regime_outputs(row=latest, decision=decision, credit_stress_index=credit_stress_index, valuation=valuation)
+    validation_metrics = calculate_model_validation_metrics(
+        model_confidence=read_float(latest.get("confidence_score") if latest else None, 50.0),
+        walk_forward_metrics=walk_forward_metrics,
+        crisis_replay_metrics=crisis_replay_metrics,
+    )
+    hmm_regime = calibrate_hmm_regime(hmm_regime, validation_metrics)
     decision = apply_hmm_regime_to_decision(decision, hmm_regime)
+    decision = calibrate_decision_outputs(decision, validation_metrics)
     precious_metals = precious_metals_outputs_from_row(latest, credit_stress_index=credit_stress_index, valuation=valuation)
     precious_metals = apply_hmm_regime_to_precious_metals(precious_metals, hmm_regime)
-    summary = format_telegram_summary(latest, decision, precious_metals, walk_forward_metrics, crisis_replay_metrics, valuation, hmm_regime)
+    precious_metals = calibrate_precious_metals(precious_metals, validation_metrics)
+    summary = format_telegram_summary(latest, decision, precious_metals, walk_forward_metrics, crisis_replay_metrics, valuation, hmm_regime, validation_metrics)
     with db_connection() as connection:
         persist_exception_log(
             connection,
@@ -480,6 +534,7 @@ def run_reporting() -> dict[str, Any]:
                 "precious_metals": precious_metals,
                 "walk_forward_metrics": walk_forward_metrics,
                 "crisis_replay_metrics": crisis_replay_metrics,
+                "validation_metrics": validation_metrics,
             },
             severity="LOW",
         )
@@ -497,6 +552,7 @@ def run_reporting() -> dict[str, Any]:
         **walk_forward_metrics,
         **crisis_replay_metrics,
         **precious_metals,
+        **validation_metrics,
     }
 
 
@@ -1481,10 +1537,13 @@ def calculate_crisis_replay_metrics() -> dict[str, float | str]:
 def neutral_crisis_replay_metrics() -> dict[str, float | str]:
     return {
         "crisis_detection_rate": 50.0,
+        "crisis_similarity_score": 50.0,
+        "crisis_replay_score": 50.0,
         "panic_false_positive_rate": 0.0,
         "recovery_detection_rate": 50.0,
         "drawdown_reduction_score": 50.0,
         "signal_quality_score": 50.0,
+        "crisis_lead_time_months": 0.0,
         "panic_lead_time_months": 0.0,
         "recovery_lead_time_months": 0.0,
         "crisis_replay_validation_method": "Neutral bootstrap: no historical crisis replay observations available yet.",
@@ -1568,6 +1627,239 @@ def apply_crisis_replay_confidence(matrix: ProbabilityMatrix, metrics: dict[str,
         confidence_score=round(bounded(matrix.confidence_score + adjustment, 0.0, 100.0), 6),
         extreme_swing_detected=matrix.extreme_swing_detected,
     )
+
+
+def calculate_model_validation_metrics(
+    *,
+    model_confidence: float,
+    walk_forward_metrics: dict[str, float | str],
+    crisis_replay_metrics: dict[str, float | str],
+) -> dict[str, Any]:
+    forecast_count, mature_count = forecast_history_counts()
+    samples = historical_validation_samples()
+    backtest_metrics = backtest_classification_metrics(samples)
+    data_completeness = current_data_completeness_score()
+    walk_forward_score = average_metric(
+        walk_forward_metrics,
+        "forecast_accuracy_3m",
+        "forecast_accuracy_6m",
+        "forecast_accuracy_12m",
+        "panic_prediction_hit_rate",
+        "recovery_prediction_hit_rate",
+        "buy_signal_success_rate",
+        "sell_signal_success_rate",
+    )
+    crisis_score = read_float(crisis_replay_metrics.get("crisis_replay_score"), 50.0)
+    crisis_coverage = read_float(crisis_replay_metrics.get("crisis_similarity_score"), 50.0)
+    validation_scores = calculate_validation_scores(
+        data_completeness=data_completeness,
+        model_confidence=normalize_confidence(model_confidence) * 100.0,
+        forecast_history_count=forecast_count,
+        mature_sample_count=mature_count,
+        crisis_coverage=crisis_coverage,
+        walk_forward_score=walk_forward_score,
+        crisis_replay_score=crisis_score,
+        calibration_error=backtest_metrics["calibration_error"],
+    )
+    status = validation_status_lists()
+    return {
+        **validation_scores,
+        **backtest_metrics,
+        **status,
+        "model_inventory": model_inventory(),
+        "historical_accuracy_summary": historical_accuracy_summary(samples, crisis_replay_metrics),
+        "top_5_drivers": top_5_drivers(data_completeness, walk_forward_score, crisis_score, validation_scores),
+        "major_warnings": major_validation_warnings(data_completeness, forecast_count, mature_count, validation_scores),
+        "forecast_history_count": forecast_count,
+        "mature_validation_sample_count": mature_count,
+    }
+
+
+def apply_maturity_calibration(matrix: ProbabilityMatrix, validation_metrics: dict[str, Any]) -> ProbabilityMatrix:
+    maturity = read_float(validation_metrics.get("forecast_maturity"), 0.0)
+    reliability = read_float(validation_metrics.get("forecast_reliability"), 50.0)
+    calibrated = {
+        forecast_type: {
+            horizon: conservative_probability(probability, maturity)
+            for horizon, probability in horizon_values.items()
+        }
+        for forecast_type, horizon_values in matrix.probabilities.items()
+    }
+    confidence = min(matrix.confidence_score, reliability)
+    return ProbabilityMatrix(
+        timestamp=matrix.timestamp,
+        probabilities=calibrated,
+        early_warning_score=matrix.early_warning_score,
+        confidence_score=round(bounded(confidence, 0.0, 100.0), 6),
+        extreme_swing_detected=matrix.extreme_swing_detected,
+    )
+
+
+def calibrate_hmm_regime(regime: dict[str, float | str], validation_metrics: dict[str, Any]) -> dict[str, float | str]:
+    maturity = read_float(validation_metrics.get("forecast_maturity"), 0.0)
+    calibrated = dict(regime)
+    calibrated["regime_probability"] = conservative_probability(read_float(regime.get("regime_probability"), 0.5), maturity)
+    calibrated["regime_confidence"] = round(
+        bounded(read_float(regime.get("regime_confidence"), 0.0) * (0.35 + min(maturity, 100.0) / 100.0 * 0.65), 0.0, 1.0),
+        6,
+    )
+    calibrated["hmm_regime_validation_method"] = (
+        str(regime.get("hmm_regime_validation_method", ""))
+        + " Calibrated with forecast-maturity shrinkage to avoid overconfidence."
+    ).strip()
+    return calibrated
+
+
+def calibrate_decision_outputs(decision: dict[str, float], validation_metrics: dict[str, Any]) -> dict[str, float]:
+    maturity = read_float(validation_metrics.get("forecast_maturity"), 0.0)
+    calibrated = dict(decision)
+    for key in ("recovery_probability_12m", "recovery_probability_24m", "buy_score", "sell_score"):
+        calibrated[key] = conservative_score(read_float(calibrated.get(key), 50.0), maturity)
+    calibrated["hold_score"] = round(max(0.0, 100.0 - calibrated["buy_score"] - calibrated["sell_score"]), 2)
+    return calibrated
+
+
+def calibrate_precious_metals(precious_metals: dict[str, object], validation_metrics: dict[str, Any]) -> dict[str, object]:
+    maturity = read_float(validation_metrics.get("forecast_maturity"), 0.0)
+    calibrated = dict(precious_metals)
+    for key in (
+        "gold_bull_probability",
+        "gold_bear_probability",
+        "gold_acceleration_probability",
+        "gold_correction_probability",
+        "silver_bull_probability",
+        "silver_bear_probability",
+        "silver_acceleration_probability",
+        "silver_correction_probability",
+    ):
+        calibrated[key] = conservative_probability(read_float(calibrated.get(key), 0.5), maturity)
+    return calibrated
+
+
+def forecast_history_counts() -> tuple[int, int]:
+    try:
+        with db_connection() as connection:
+            ensure_runtime_tables(connection)
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT COUNT(*) FROM forecast_history")
+                total = int(cursor.fetchone()[0] or 0)
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM forecast_history
+                    WHERE forecast_date <= %s
+                    """,
+                    (utc_now() - timedelta(days=90),),
+                )
+                mature = int(cursor.fetchone()[0] or 0)
+        return total, mature
+    except Exception:
+        return 0, 0
+
+
+def historical_validation_samples() -> list[ForecastValidationSample]:
+    samples: list[ForecastValidationSample] = []
+    try:
+        with db_connection() as connection:
+            ensure_runtime_tables(connection)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT forecast_date, forecast_value
+                    FROM forecast_history
+                    WHERE forecast_type = 'panic_probability_12m'
+                    ORDER BY forecast_date ASC
+                    LIMIT 500
+                    """
+                )
+                rows = cursor.fetchall()
+            for forecast_date, forecast_value in rows:
+                realized_return = realized_market_return(connection, forecast_date, 12)
+                realized_drawdown = realized_market_drawdown(connection, forecast_date, 12)
+                if realized_return is None:
+                    continue
+                outcome = 1 if realized_return < -0.08 else 0
+                samples.append(
+                    ForecastValidationSample(
+                        probability=read_forecast_value(forecast_value),
+                        outcome=outcome,
+                        lead_time_months=12.0,
+                        avoided_drawdown=realized_drawdown or 0.0,
+                    )
+                )
+    except Exception:
+        return []
+    return samples
+
+
+def current_data_completeness_score() -> float:
+    checks = [
+        1.0 if latest_asset_price_any(("NIFTY 50", "NIFTY BANK")) is not None else 0.0,
+        1.0 if latest_asset_price_any(PRECIOUS_METALS_ASSET_ALIASES["gold"]) is not None else 0.0,
+        1.0 if latest_asset_price_any(PRECIOUS_METALS_ASSET_ALIASES["silver"]) is not None else 0.0,
+        1.0 if latest_asset_price_any(CREDIT_ASSET_ALIASES["high_yield_credit"]) is not None else 0.0,
+        1.0 if latest_asset_price_any(CREDIT_ASSET_ALIASES["investment_grade_credit"]) is not None else 0.0,
+        1.0 if latest_macro_any(VALUATION_INDICATOR_ALIASES["cape"]) is not None else 0.0,
+        1.0 if latest_macro_any(VALUATION_INDICATOR_ALIASES["earnings_yield"]) is not None else 0.0,
+        1.0 if latest_macro_any(VALUATION_INDICATOR_ALIASES["dividend_yield"]) is not None else 0.0,
+        1.0 if latest_breadth_row() else 0.0,
+        1.0 if latest_systemic_stress() is not None else 0.0,
+    ]
+    return round(sum(checks) / len(checks) * 100.0, 6)
+
+
+def historical_accuracy_summary(samples: Sequence[ForecastValidationSample], crisis_metrics: dict[str, float | str]) -> list[dict[str, float | str]]:
+    summary = []
+    metrics = backtest_classification_metrics(samples)
+    for period in historical_validation_summary():
+        summary.append(
+            {
+                "period": period["period"],
+                "predicted_regime": "historical analog validation",
+                "predicted_panic_probability": round(read_float(crisis_metrics.get("crisis_similarity_score"), 50.0) / 100.0, 6),
+                "predicted_recovery_probability": round(read_float(crisis_metrics.get("recovery_detection_rate"), 50.0) / 100.0, 6),
+                "predicted_buy_hold_sell": "derived from calibrated decision engine",
+                "expected_drawdown": metrics["maximum_drawdown_avoided"],
+                "expected_return": "stored forecast-history comparison when mature",
+                "actual_outcome": period["actual_outcome"],
+                "prediction_error": metrics["brier_score"],
+                "lead_time": period["expected_lead_time_months"],
+            }
+        )
+    return summary
+
+
+def top_5_drivers(
+    data_completeness: float,
+    walk_forward_score: float,
+    crisis_score: float,
+    validation_scores: dict[str, float | str],
+) -> list[str]:
+    drivers = [
+        f"Data completeness {data_completeness:.1f}/100",
+        f"Forecast reliability {read_float(validation_scores.get('forecast_reliability'), 0.0):.1f}/100",
+        f"Walk-forward score {walk_forward_score:.1f}/100",
+        f"Crisis replay score {crisis_score:.1f}/100",
+        f"Forecast maturity {read_float(validation_scores.get('forecast_maturity'), 0.0):.1f}/100",
+    ]
+    return drivers[:5]
+
+
+def major_validation_warnings(
+    data_completeness: float,
+    forecast_count: int,
+    mature_count: int,
+    validation_scores: dict[str, float | str],
+) -> list[str]:
+    warnings = []
+    if data_completeness < 80.0:
+        warnings.append("Data completeness below 80%; confidence is discounted.")
+    if mature_count < 20:
+        warnings.append("Walk-forward sample count is low; forecast maturity is limited.")
+    if forecast_count < 52:
+        warnings.append("Less than one year of stored forecast history.")
+    if read_float(validation_scores.get("forecast_reliability"), 0.0) < 70.0:
+        warnings.append("Forecast reliability below production-grade threshold.")
+    return warnings[:5]
 
 
 def crisis_replay_observations(connection: Any) -> dict[str, list[ReplayObservation]]:
@@ -2315,6 +2607,7 @@ def format_telegram_summary(
     crisis_replay_metrics: dict[str, float | str] | None = None,
     valuation: dict[str, float | str] | None = None,
     hmm_regime: dict[str, float | str] | None = None,
+    validation_metrics: dict[str, Any] | None = None,
 ) -> str:
     if not row:
         return "Aegis Monthly Alert\n\nNo probability output is available yet."
@@ -2333,32 +2626,25 @@ def format_telegram_summary(
         credit_stress_index=read_float(decision.get("credit_stress_index"), calculate_credit_stress_index()),
         valuation=valuation,
     )
+    validation_metrics = validation_metrics or calculate_model_validation_metrics(
+        model_confidence=read_float(row.get("confidence_score"), 50.0),
+        walk_forward_metrics=walk_forward_metrics,
+        crisis_replay_metrics=crisis_replay_metrics,
+    )
+    drivers = validation_metrics.get("top_5_drivers", [])
+    warnings = validation_metrics.get("major_warnings", [])
+    driver_text = "\n".join(f"- {driver}" for driver in drivers[:5]) if drivers else "- No dominant drivers available"
+    warning_text = "\n".join(f"- {warning}" for warning in warnings[:5]) if warnings else "- No major warnings"
     return (
         "Aegis Monthly Alert\n\n"
-        f"Regime: {row['current_regime']}\n"
-        f"HMM Regime: {hmm_regime['regime_state']} ({hmm_regime['regime_probability']})\n"
-        f"Crash 1M: {row['crash_prob_1m']}\n"
-        f"Crash 3M: {row['crash_prob_3m']}\n"
-        f"Crash 6M: {row['crash_prob_6m']}\n"
-        f"Crash 12M: {row['crash_prob_12m']}\n"
-        f"Credit Stress Index: {decision['credit_stress_index']}\n"
-        f"Valuation Score/Risk/Pctl: {decision['valuation_score']}/{decision['valuation_risk_score']}/{decision['valuation_percentile']}\n"
-        f"Recovery 12M/24M: {decision['recovery_probability_12m']}/{decision['recovery_probability_24m']}\n"
+        f"Market Regime: {hmm_regime['regime_state']} ({row['current_regime']})\n"
         f"Buy/Hold/Sell: {decision['buy_score']}/{decision['hold_score']}/{decision['sell_score']}\n"
         f"Expected Return 12M: {format_percent(decision['expected_return_12m'])}\n"
         f"Expected Drawdown 12M: {format_percent(decision['expected_drawdown_12m'])}\n"
-        f"WF Accuracy 3M/6M/12M: {walk_forward_metrics['forecast_accuracy_3m']}/{walk_forward_metrics['forecast_accuracy_6m']}/{walk_forward_metrics['forecast_accuracy_12m']}\n"
-        f"Buy/Sell Hit Rate: {walk_forward_metrics['buy_signal_success_rate']}/{walk_forward_metrics['sell_signal_success_rate']}\n"
-        f"Crisis Replay Det/Rec/Quality: {crisis_replay_metrics['crisis_detection_rate']}/{crisis_replay_metrics['recovery_detection_rate']}/{crisis_replay_metrics['signal_quality_score']}\n"
-        f"Crisis Similarity/Replay: {crisis_replay_metrics['crisis_similarity_score']}/{crisis_replay_metrics['crisis_replay_score']}\n"
-        f"Crisis Lead Panic/Recovery: {crisis_replay_metrics['panic_lead_time_months']}m/{crisis_replay_metrics['recovery_lead_time_months']}m\n"
-        f"Gold Bull/Bear: {precious_metals['gold_bull_probability']}/{precious_metals['gold_bear_probability']}\n"
-        f"Gold Buy/Hold/Sell: {precious_metals['gold_buy_score']}/{precious_metals['gold_hold_score']}/{precious_metals['gold_sell_score']}\n"
-        f"Silver Bull/Bear: {precious_metals['silver_bull_probability']}/{precious_metals['silver_bear_probability']}\n"
-        f"Silver Buy/Hold/Sell: {precious_metals['silver_buy_score']}/{precious_metals['silver_hold_score']}/{precious_metals['silver_sell_score']}\n"
-        f"Gold/Silver Ratio: {precious_metals['gold_silver_ratio']}\n"
-        f"Early Warning Score: {row['early_warning_score']}\n"
-        f"Confidence: {row['confidence_score']}\n"
+        f"Confidence: {validation_metrics['model_confidence']}\n"
+        f"Forecast Reliability: {validation_metrics['forecast_reliability']}\n\n"
+        f"Top 5 Drivers:\n{driver_text}\n\n"
+        f"Major Warnings:\n{warning_text}\n\n"
         f"Timestamp UTC: {row['timestamp']}"
     )
 
