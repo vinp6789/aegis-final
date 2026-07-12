@@ -12,6 +12,14 @@ from statistics import mean
 from typing import Any, Iterable, Mapping, Protocol, Sequence
 
 from analytics.common import clamp
+from analytics.synthesis.decision_engine import decision_outputs_from_matrix
+from analytics.synthesis.hmm_regime import HMMRegimeInput, HMMRegimeModel
+from analytics.synthesis.precious_metals_regime import PreciousMetalsInput, PreciousMetalsRegimeEngine
+from analytics.synthesis.probability_aggregator import AggregatorInput, ProbabilityAggregator
+from analytics.synthesis.valuation_layer import ValuationEngine, ValuationInput
+from analytics.validation.backtest_engine import BacktestEngine
+from analytics.validation.forecast_outcomes import ForecastOutcomeRecord, ForecastOutcomeValidator
+from analytics.validation.model_validation import SYSTEMIC_STRESS_RETURN_THRESHOLD, ForecastValidationSample, backtest_classification_metrics
 
 
 class DbConnection(Protocol):
@@ -88,6 +96,33 @@ class HistoricalResearchReport:
     research_completeness_estimate: float
     remaining_historical_gaps: list[str]
     self_learning_process: dict[str, str]
+
+
+@dataclass(frozen=True)
+class HistoricalReplayPrediction:
+    replay_date: datetime
+    inputs: dict[str, float]
+    outputs: dict[str, Any]
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class HistoricalReplaySkippedMonth:
+    replay_date: datetime
+    reason: str
+
+
+@dataclass(frozen=True)
+class HistoricalReplaySummary:
+    generated_at: datetime
+    replay_start: datetime | None
+    replay_end: datetime | None
+    completed_months: int
+    skipped_months: list[HistoricalReplaySkippedMonth]
+    coverage: list[dict[str, Any]]
+    missing_historical_data: list[str]
+    validation_statistics: dict[str, Any]
+    model_reliability_trend: dict[str, Any]
 
 
 DATASET_SPECS: tuple[DatasetSpec, ...] = (
@@ -182,6 +217,25 @@ class HistoricalBackfillPipeline:
         return {spec.target_code: self.fetch_historical_points(spec) for spec in self.specs if spec.automatic_backfill}
 
     def reconstruct_monthly_forecasts(self, points_by_code: Mapping[str, Sequence[HistoricalPoint]]) -> list[ReconstructedForecast]:
+        return replay_run_to_forecasts(HistoricalReplayEngine().run(points_by_code))
+
+    def replay_history(
+        self,
+        points_by_code: Mapping[str, Sequence[HistoricalPoint]],
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        completed_months: Iterable[datetime] = (),
+    ) -> "HistoricalReplayRun":
+        return HistoricalReplayEngine().run(
+            points_by_code,
+            start=start,
+            end=end,
+            completed_months=completed_months,
+            specs=self.specs,
+        )
+
+    def reconstruct_legacy_monthly_forecasts(self, points_by_code: Mapping[str, Sequence[HistoricalPoint]]) -> list[ReconstructedForecast]:
         monthly = monthly_feature_rows(points_by_code)
         forecasts: list[ReconstructedForecast] = []
         for timestamp, values in monthly.items():
@@ -259,6 +313,219 @@ class HistoricalBackfillPipeline:
             "research_report": self.persist_research_report(connection, report) if report is not None else 0,
         }
         return counts
+
+    def persist_asset_registry(self, connection: DbConnection) -> int:
+        return HistoricalReplayEngine().persist_asset_registry(connection)
+
+    def persist_market_points(self, connection: DbConnection, points_by_code: Mapping[str, Sequence[HistoricalPoint]]) -> int:
+        return HistoricalReplayEngine().persist_market_points(connection, points_by_code)
+
+    def persist_macro_points(self, connection: DbConnection, points_by_code: Mapping[str, Sequence[HistoricalPoint]]) -> int:
+        return HistoricalReplayEngine(specs=self.specs).persist_macro_points(connection, points_by_code)
+
+    def persist_stablecoin_points(self, connection: DbConnection, points_by_code: Mapping[str, Sequence[HistoricalPoint]]) -> int:
+        return HistoricalReplayEngine().persist_stablecoin_points(connection, points_by_code)
+
+    def persist_forecast_history(self, connection: DbConnection, forecasts: Sequence[ReconstructedForecast]) -> int:
+        return HistoricalReplayEngine().persist_forecast_history(connection, forecasts)
+
+    def persist_validation_dataset(self, connection: DbConnection, rows: Sequence[HistoricalValidationRow]) -> int:
+        return HistoricalReplayEngine().persist_validation_dataset(connection, rows)
+
+    def persist_replay_run(
+        self,
+        connection: DbConnection,
+        run: "HistoricalReplayRun",
+        report: HistoricalResearchReport | None = None,
+    ) -> dict[str, int]:
+        return HistoricalReplayEngine().persist_replay_run(connection, run, report)
+
+    def completed_replay_months(self, connection: DbConnection, target_scope: str = "GLOBAL") -> set[datetime]:
+        return HistoricalReplayEngine().completed_replay_months(connection, target_scope)
+
+    def persist_research_report(self, connection: DbConnection, report: HistoricalResearchReport) -> int:
+        return HistoricalReplayEngine().persist_research_report(connection, report)
+
+    def persist_crisis_library(self, connection: DbConnection) -> int:
+        return HistoricalReplayEngine(events=self.events).persist_crisis_library(connection)
+
+
+@dataclass(frozen=True)
+class HistoricalReplayRun:
+    predictions: list[HistoricalReplayPrediction]
+    validation_rows: list[HistoricalValidationRow]
+    summary: HistoricalReplaySummary
+
+
+class HistoricalReplayEngine:
+    def __init__(
+        self,
+        *,
+        probability_engine: ProbabilityAggregator | None = None,
+        hmm_model: HMMRegimeModel | None = None,
+        valuation_engine: ValuationEngine | None = None,
+        precious_metals_engine: PreciousMetalsRegimeEngine | None = None,
+        specs: Sequence[DatasetSpec] = DATASET_SPECS,
+        events: Sequence[MarketEvent] = MARKET_EVENT_CATALOG,
+        horizon_months: int = 12,
+    ) -> None:
+        if horizon_months <= 0:
+            raise ValueError("horizon_months must be positive")
+        self.probability_engine = probability_engine or ProbabilityAggregator()
+        self.hmm_model = hmm_model or HMMRegimeModel()
+        self.valuation_engine = valuation_engine or ValuationEngine()
+        self.precious_metals_engine = precious_metals_engine or PreciousMetalsRegimeEngine()
+        self.specs = tuple(specs)
+        self.events = tuple(events)
+        self.horizon_months = horizon_months
+
+    def run(
+        self,
+        points_by_code: Mapping[str, Sequence[HistoricalPoint]],
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        completed_months: Iterable[datetime] = (),
+        specs: Sequence[DatasetSpec] = DATASET_SPECS,
+    ) -> HistoricalReplayRun:
+        replay_dates = replay_months(points_by_code, start=start, end=end)
+        completed = {month_start(timestamp) for timestamp in completed_months}
+        predictions: list[HistoricalReplayPrediction] = []
+        skipped: list[HistoricalReplaySkippedMonth] = []
+        previous_systemic: float | None = None
+        hmm_history: list[HMMRegimeInput] = []
+
+        for replay_date in replay_dates:
+            if replay_date in completed:
+                skipped.append(HistoricalReplaySkippedMonth(replay_date, "already completed"))
+                continue
+            values = point_in_time_feature_row(points_by_code, replay_date)
+            if values.get("SP500") is None:
+                skipped.append(HistoricalReplaySkippedMonth(replay_date, "missing SP500 at replay date"))
+                continue
+            prediction, hmm_input = self.replay_month(
+                replay_date,
+                values,
+                previous_systemic_12m=previous_systemic,
+                hmm_history=hmm_history,
+            )
+            predictions.append(prediction)
+            hmm_history.append(hmm_input)
+            previous_systemic = prediction.outputs["systemic_stress_12m"]
+
+        validation_rows = build_validation_dataset_from_replays(
+            points_by_code,
+            predictions,
+            horizon_months=self.horizon_months,
+        )
+        statistics = historical_replay_validation_statistics(validation_rows)
+        coverage = coverage_report_from_points(specs, points_by_code, current_year=(end or datetime.now(timezone.utc)).year)
+        summary = HistoricalReplaySummary(
+            generated_at=datetime.now(timezone.utc),
+            replay_start=replay_dates[0] if replay_dates else None,
+            replay_end=replay_dates[-1] if replay_dates else None,
+            completed_months=len(predictions),
+            skipped_months=skipped,
+            coverage=coverage,
+            missing_historical_data=remaining_historical_gaps(coverage),
+            validation_statistics=statistics,
+            model_reliability_trend=statistics["model_reliability_trend"],
+        )
+        return HistoricalReplayRun(predictions=predictions, validation_rows=validation_rows, summary=summary)
+
+    def replay_month(
+        self,
+        replay_date: datetime,
+        values: Mapping[str, float],
+        *,
+        previous_systemic_12m: float | None,
+        hmm_history: Sequence[HMMRegimeInput],
+    ) -> tuple[HistoricalReplayPrediction, HMMRegimeInput]:
+        valuation = self.valuation_engine.evaluate(
+            ValuationInput(
+                cape=values.get("SHILLER_CAPE"),
+                earnings_yield=values.get("SP500_EARNINGS_YIELD"),
+                dividend_yield=values.get("SP500_DIVIDEND_YIELD"),
+            )
+        )
+        credit_stress = credit_stress_from_values(values)
+        liquidity = liquidity_from_values(values)
+        market_return = trailing_return(values.get("SP500"), values.get("_SP500_PREV_12M"))
+        inflation = normalize(values.get("FRED_CPIAUCSL"), low=80.0, high=320.0, default=50.0)
+        curve_stress = normalize(-(values.get("FRED_T10Y2Y") or 0.0), low=-1.0, high=2.0, default=45.0)
+        breadth_proxy = clamp(market_return * 4.0, -1.0, 1.0)
+        volatility_proxy = clamp(abs(market_return) * 220.0, 10.0, 90.0)
+        backtest_sharpe = clamp(market_return * 4.0, -1.0, 2.0)
+        backtest_win_rate = clamp(0.50 + market_return, 0.0, 1.0)
+        matrix = self.probability_engine.aggregate(
+            AggregatorInput(
+                timestamp=replay_date,
+                liquidity_index=liquidity,
+                liquidity_transmission_score=liquidity,
+                leading_diffusion_index=breadth_proxy,
+                hhi_concentration_score=clamp(credit_stress / 100.0, 0.0, 1.0),
+                discovery_score=credit_stress,
+                backtest_sharpe=backtest_sharpe,
+                backtest_win_rate=backtest_win_rate,
+                regime_probability=credit_stress / 100.0,
+                volatility_index=volatility_proxy,
+                crypto_liquidity_index=liquidity,
+                previous_systemic_stress_12m=previous_systemic_12m,
+            )
+        )
+        systemic_12m = matrix.probabilities["systemic_stress"][12]
+        market_crash_12m = matrix.probabilities["market_crash"][12]
+        decision = decision_outputs_from_matrix(
+            matrix,
+            credit_stress_index=credit_stress,
+            valuation=valuation.to_dict(),
+            liquidity_index=liquidity,
+        )
+        hmm_input = HMMRegimeInput(
+            liquidity_index=liquidity,
+            credit_stress_index=credit_stress,
+            recovery_probability=decision["recovery_probability_12m"],
+            valuation_score=valuation.valuation_score,
+            expected_return=decision["expected_return_12m"],
+            expected_drawdown=decision["expected_drawdown_12m"],
+            panic_probability=systemic_12m,
+        )
+        regime = self.hmm_model.classify(hmm_input, history=hmm_history).to_dict()
+        metals = self.precious_metals_engine.evaluate(
+            PreciousMetalsInput(
+                liquidity_index=liquidity,
+                credit_stress_index=credit_stress,
+                market_crash_probability=market_crash_12m,
+                systemic_stress_probability=systemic_12m,
+                inflation_pressure=inflation,
+                real_rate_pressure=curve_stress,
+                dollar_pressure=normalize(values.get("DXY"), low=70.0, high=130.0, default=50.0),
+                gold_silver_ratio=gold_silver_ratio(values),
+                gold_momentum=trailing_return(values.get("GOLD"), values.get("_GOLD_PREV_12M")),
+                silver_momentum=trailing_return(values.get("SILVER"), values.get("_SILVER_PREV_12M")),
+            )
+        ).to_dict()
+        outputs = {
+            "market_crash_12m": market_crash_12m,
+            "systemic_stress_12m": systemic_12m,
+            "early_warning_score": matrix.early_warning_score,
+            "confidence": matrix.confidence_score,
+            "panic_probability_12m": systemic_12m,
+            **decision,
+            **valuation.to_dict(),
+            **regime,
+            **metals,
+        }
+        metadata = {
+            "source": "historical_replay",
+            "forecast_origin": "historical_replay",
+            "replay_generated": True,
+            "method": "point-in-time replay using existing Aegis synthesis engines",
+            "input_cutoff": replay_date.isoformat(),
+            "no_lookahead": True,
+            "input_codes": sorted(key for key in values if not key.startswith("_")),
+        }
+        return HistoricalReplayPrediction(replay_date, replay_inputs(values, liquidity, credit_stress, valuation.valuation_score), outputs, metadata), hmm_input
 
     def persist_asset_registry(self, connection: DbConnection) -> int:
         rows = [
@@ -365,6 +632,33 @@ class HistoricalBackfillPipeline:
                 rows,
             )
         return len(rows)
+
+    def persist_replay_run(
+        self,
+        connection: DbConnection,
+        run: HistoricalReplayRun,
+        report: HistoricalResearchReport | None = None,
+    ) -> dict[str, int]:
+        counts = {
+            "forecast_history": self.persist_forecast_history(connection, replay_run_to_forecasts(run)),
+            "historical_validation_rows": self.persist_validation_dataset(connection, run.validation_rows),
+            "research_report": self.persist_research_report(connection, report) if report is not None else 0,
+        }
+        return counts
+
+    def completed_replay_months(self, connection: DbConnection, target_scope: str = "GLOBAL") -> set[datetime]:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT DISTINCT forecast_date
+                FROM forecast_history
+                WHERE target_scope = %s
+                  AND forecast_type = 'panic_probability_12m'
+                  AND metadata->>'source' = 'historical_replay'
+                """,
+                (target_scope,),
+            )
+            return {month_start(row[0]) for row in cursor.fetchall()}
 
     def persist_validation_dataset(self, connection: DbConnection, rows: Sequence[HistoricalValidationRow]) -> int:
         if not rows:
@@ -714,7 +1008,7 @@ def build_validation_dataset(
         if current_price is None or future_price is None or current_price <= 0.0:
             continue
         realized_return = (future_price - current_price) / current_price
-        realized_outcome = 1 if realized_return <= -0.20 else 0
+        realized_outcome = 1 if realized_return < SYSTEMIC_STRESS_RETURN_THRESHOLD else 0
         panic_probability = month_forecasts.get("panic_probability_12m", 0.5)
         prediction_error = abs(panic_probability - realized_outcome)
         rows.append(
@@ -726,10 +1020,225 @@ def build_validation_dataset(
                 realized_outcome=realized_outcome,
                 realized_return=round(realized_return, 10),
                 prediction_error=round(prediction_error, 10),
-                lead_time_months=lead_time_to_threshold(sp500, timestamp, horizon_months, threshold_return=-0.20),
+                lead_time_months=lead_time_to_threshold(sp500, timestamp, horizon_months, threshold_return=SYSTEMIC_STRESS_RETURN_THRESHOLD),
             )
         )
     return rows
+
+
+def build_validation_dataset_from_replays(
+    points_by_code: Mapping[str, Sequence[HistoricalPoint]],
+    predictions: Sequence[HistoricalReplayPrediction],
+    *,
+    horizon_months: int = 12,
+) -> list[HistoricalValidationRow]:
+    sp500 = monthly_price_map(points_by_code.get("SP500", ()))
+    rows: list[HistoricalValidationRow] = []
+    for prediction in sorted(predictions, key=lambda item: item.replay_date):
+        current_price = sp500.get(month_start(prediction.replay_date))
+        future_timestamp = add_months(prediction.replay_date, horizon_months)
+        future_price = value_at_or_after(sp500, future_timestamp)
+        if current_price is None or future_price is None or current_price <= 0.0:
+            continue
+        realized_return = (future_price - current_price) / current_price
+        realized_outcome = 1 if realized_return < SYSTEMIC_STRESS_RETURN_THRESHOLD else 0
+        panic_probability = float(prediction.outputs["panic_probability_12m"])
+        prediction_error = abs(panic_probability - realized_outcome)
+        rows.append(
+            HistoricalValidationRow(
+                forecast_date=prediction.replay_date,
+                horizon_months=horizon_months,
+                inputs=dict(prediction.inputs),
+                predictions=replay_forecast_values(prediction.outputs),
+                realized_outcome=realized_outcome,
+                realized_return=round(realized_return, 10),
+                prediction_error=round(prediction_error, 10),
+                lead_time_months=lead_time_to_threshold(sp500, prediction.replay_date, horizon_months, threshold_return=SYSTEMIC_STRESS_RETURN_THRESHOLD),
+            )
+        )
+    return rows
+
+
+def replay_months(
+    points_by_code: Mapping[str, Sequence[HistoricalPoint]],
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> list[datetime]:
+    months = sorted({month_start(point.timestamp) for points in points_by_code.values() for point in points})
+    if start is not None:
+        start_month = month_start(start)
+        months = [timestamp for timestamp in months if timestamp >= start_month]
+    if end is not None:
+        end_month = month_start(end)
+        months = [timestamp for timestamp in months if timestamp <= end_month]
+    return months
+
+
+def point_in_time_feature_row(
+    points_by_code: Mapping[str, Sequence[HistoricalPoint]],
+    replay_date: datetime,
+) -> dict[str, float]:
+    cutoff = month_start(replay_date)
+    values: dict[str, float] = {}
+    for code, points in points_by_code.items():
+        value = latest_point_value(points, cutoff)
+        if value is not None:
+            values[code] = value
+    for code in ("SP500", "GOLD", "SILVER"):
+        previous = prior_point_value(points_by_code.get(code, ()), cutoff, months=12)
+        if previous is not None:
+            values[f"_{code}_PREV_12M"] = previous
+    return values
+
+
+def latest_point_value(points: Sequence[HistoricalPoint], cutoff: datetime) -> float | None:
+    candidates = [point.value for point in points if month_start(point.timestamp) <= cutoff]
+    return candidates[-1] if candidates else None
+
+
+def prior_point_value(points: Sequence[HistoricalPoint], timestamp: datetime, *, months: int) -> float | None:
+    target = add_months(timestamp, -months)
+    candidates = [point.value for point in points if month_start(point.timestamp) <= target]
+    return candidates[-1] if candidates else None
+
+
+def gold_silver_ratio(values: Mapping[str, float]) -> float | None:
+    gold = values.get("GOLD")
+    silver = values.get("SILVER")
+    if gold is None or silver is None or silver <= 0.0:
+        return None
+    return gold / silver
+
+
+def replay_inputs(values: Mapping[str, float], liquidity: float, credit_stress: float, valuation_score: float) -> dict[str, float]:
+    return {
+        "sp500": values.get("SP500", 0.0),
+        "liquidity_index": round(liquidity, 6),
+        "credit_stress_index": round(credit_stress, 6),
+        "valuation_score": round(valuation_score, 6),
+        "cape": values.get("SHILLER_CAPE", 0.0),
+        "inflation": values.get("FRED_CPIAUCSL", 0.0),
+        "yield_curve": values.get("FRED_T10Y2Y", 0.0),
+    }
+
+
+def replay_forecast_values(outputs: Mapping[str, Any]) -> dict[str, float]:
+    keys = (
+        "market_crash_12m",
+        "systemic_stress_12m",
+        "panic_probability_12m",
+        "recovery_probability_12m",
+        "buy_score",
+        "hold_score",
+        "sell_score",
+        "expected_return_12m",
+        "expected_drawdown_12m",
+        "confidence",
+        "credit_stress_index",
+        "valuation_score",
+        "valuation_risk_score",
+        "gold_bull_probability",
+        "gold_bear_probability",
+        "silver_bull_probability",
+        "silver_bear_probability",
+    )
+    return {key: float(outputs[key]) for key in keys if key in outputs and isinstance(outputs[key], (int, float))}
+
+
+def replay_run_to_forecasts(run: HistoricalReplayRun) -> list[ReconstructedForecast]:
+    forecasts: list[ReconstructedForecast] = []
+    for prediction in run.predictions:
+        for forecast_type, forecast_value in replay_forecast_values(prediction.outputs).items():
+            forecasts.append(
+                ReconstructedForecast(
+                    prediction.replay_date,
+                    forecast_type,
+                    forecast_value,
+                    float(prediction.outputs["confidence"]),
+                    prediction.metadata,
+                )
+            )
+    return forecasts
+
+
+def historical_replay_validation_statistics(rows: Sequence[HistoricalValidationRow]) -> dict[str, Any]:
+    samples = [
+        ForecastValidationSample(
+            probability=row.predictions.get("panic_probability_12m", 0.5),
+            outcome=row.realized_outcome,
+            lead_time_months=row.lead_time_months,
+            avoided_drawdown=max(0.0, -row.realized_return),
+        )
+        for row in rows
+    ]
+    classification = backtest_classification_metrics(samples)
+    confusion = confusion_matrix(samples)
+    curve = calibration_curve(samples)
+    returns = [row.realized_return for row in rows]
+    stats = BacktestEngine(trading_periods_per_year=12).calculate_stats(returns)
+    records = [
+        ForecastOutcomeRecord(
+            timestamp=row.forecast_date,
+            resolved_timestamp=add_months(row.forecast_date, row.horizon_months),
+            probability=row.predictions.get("panic_probability_12m", 0.5),
+            realized_outcome=row.realized_outcome,
+            factors=row.inputs,
+            production_weights={"liquidity_index": 0.25, "credit_stress_index": 0.25, "valuation_score": 0.25, "sp500": 0.25},
+        )
+        for row in rows
+    ]
+    trend = ForecastOutcomeValidator().validate(records, as_of=add_months(rows[-1].forecast_date, rows[-1].horizon_months) if rows else None).reliability_trend
+    return {
+        **classification,
+        "annualized_return": stats.cagr,
+        "sharpe_ratio": stats.sharpe,
+        "sortino_ratio": stats.sortino,
+        "confusion_matrix": confusion,
+        "calibration_curve": curve,
+        "resolved_forecasts": len(rows),
+        "model_reliability_trend": {
+            "direction": trend.direction,
+            "reliability_score": trend.reliability_score,
+            "short_term_score": trend.short_term_score,
+            "long_term_score": trend.long_term_score,
+            "slope": trend.slope,
+        },
+    }
+
+
+def confusion_matrix(samples: Sequence[ForecastValidationSample]) -> dict[str, int]:
+    predictions = [1 if sample.probability >= 0.5 else 0 for sample in samples]
+    outcomes = [int(sample.outcome) for sample in samples]
+    return {
+        "true_positive": sum(1 for pred, outcome in zip(predictions, outcomes) if pred == 1 and outcome == 1),
+        "false_positive": sum(1 for pred, outcome in zip(predictions, outcomes) if pred == 1 and outcome == 0),
+        "true_negative": sum(1 for pred, outcome in zip(predictions, outcomes) if pred == 0 and outcome == 0),
+        "false_negative": sum(1 for pred, outcome in zip(predictions, outcomes) if pred == 0 and outcome == 1),
+    }
+
+
+def calibration_curve(samples: Sequence[ForecastValidationSample], *, bins: int = 10) -> list[dict[str, float | int]]:
+    if bins <= 0:
+        raise ValueError("bins must be positive")
+    curve = []
+    for index in range(bins):
+        lower = index / bins
+        upper = (index + 1) / bins
+        if index == bins - 1:
+            members = [sample for sample in samples if lower <= sample.probability <= upper]
+        else:
+            members = [sample for sample in samples if lower <= sample.probability < upper]
+        curve.append(
+            {
+                "bin_lower": lower,
+                "bin_upper": upper,
+                "sample_count": len(members),
+                "mean_probability": round(mean([sample.probability for sample in members]), 10) if members else 0.0,
+                "event_rate": round(mean([sample.outcome for sample in members]), 10) if members else 0.0,
+            }
+        )
+    return curve
 
 
 def build_research_report(
@@ -929,6 +1438,9 @@ def add_months(timestamp: datetime, months: int) -> datetime:
     while month > 12:
         month -= 12
         year += 1
+    while month <= 0:
+        month += 12
+        year -= 1
     return datetime(year, month, 1, tzinfo=timezone.utc)
 
 

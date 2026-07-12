@@ -8,12 +8,14 @@ import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from statistics import pstdev
 from typing import Any, Iterator, Sequence
 
 import psycopg2
 from fastapi import FastAPI, HTTPException
 
 from analytics.diagnostics.breadth_engine import BreadthEngine, ComponentSnapshot
+from analytics.diagnostics.liquidity_engine import LiquidityEngine, LiquidityInput, LiquiditySnapshot
 from analytics.diagnostics.macro_regime import MacroRegimeClassifier, RegimeInput
 from analytics.governance.explainability_engine import ExplainabilityEngine, FeatureVector
 from analytics.governance.forecast_auditor import ForecastAuditor, ForecastRecord
@@ -23,7 +25,9 @@ from analytics.synthesis.probability_aggregator import (
     ProbabilityAggregator,
     ProbabilityMatrix,
     ProbabilityMatrixPersistenceAdapter,
+    LiquidityToProbabilityAdapter,
 )
+from analytics.synthesis.decision_engine import build_decision_outputs, calculate_recovery_probabilities, decision_outputs_from_matrix as shared_decision_outputs_from_matrix
 from analytics.synthesis.hmm_regime import HMMRegimeInput, HMMRegimeModel
 from analytics.synthesis.precious_metals_regime import PreciousMetalsInput, PreciousMetalsRegimeEngine
 from analytics.synthesis.scenario_engine import ScenarioRun, ScenarioEngine
@@ -37,6 +41,7 @@ from analytics.validation.model_validation import (
     conservative_score,
     historical_validation_summary,
     model_inventory,
+    SYSTEMIC_STRESS_RETURN_THRESHOLD,
     validation_status_lists,
 )
 
@@ -668,18 +673,21 @@ def db_connection() -> Iterator[Any]:
 def build_aggregator_input() -> AggregatorInput:
     latest_breadth = latest_breadth_row()
     previous_systemic = latest_systemic_stress()
+    liquidity = latest_liquidity_snapshot()
+    liquidity_values = LiquidityToProbabilityAdapter().to_input(liquidity) if liquidity else {}
+    walk_forward = calculate_walk_forward_metrics()
     return AggregatorInput(
         timestamp=utc_now(),
-        liquidity_index=latest_macro_value("GLOBAL_LIQUIDITY_INDEX", 55.0),
-        liquidity_transmission_score=50.0,
-        leading_diffusion_index=float(latest_breadth.get("leading_diffusion_index", 0.05)),
-        hhi_concentration_score=float(latest_breadth.get("hhi_concentration_score", 0.30)),
-        discovery_score=50.0,
-        backtest_sharpe=0.50,
-        backtest_win_rate=0.55,
-        regime_probability=float(latest_breadth.get("regime_probability", 0.45)),
-        volatility_index=35.0,
-        crypto_liquidity_index=50.0,
+        liquidity_index=liquidity_values.get("liquidity_index", latest_macro_value("GLOBAL_LIQUIDITY_INDEX", None)),
+        liquidity_transmission_score=liquidity_values.get("liquidity_transmission_score"),
+        leading_diffusion_index=latest_breadth.get("leading_diffusion_index"),
+        hhi_concentration_score=latest_breadth.get("hhi_concentration_score"),
+        discovery_score=latest_discovery_score(),
+        backtest_sharpe=None,
+        backtest_win_rate=walk_forward_win_rate(walk_forward),
+        regime_probability=latest_breadth.get("regime_probability"),
+        volatility_index=latest_market_volatility_index(),
+        crypto_liquidity_index=liquidity_values.get("crypto_liquidity_index"),
         previous_systemic_stress_12m=previous_systemic,
     )
 
@@ -1047,7 +1055,7 @@ def latest_components() -> list[ComponentSnapshot]:
     ]
 
 
-def latest_macro_value(indicator_code: str, default: float) -> float:
+def latest_macro_value(indicator_code: str, default: float | None) -> float | None:
     try:
         with db_connection() as connection:
             with connection.cursor() as cursor:
@@ -1207,11 +1215,164 @@ def latest_breadth_row() -> dict[str, float]:
             return {
                 "leading_diffusion_index": float(row[0]),
                 "hhi_concentration_score": float(row[1]),
-                "regime_probability": float(row[2] or 0.45),
+                "regime_probability": float(row[2]) if row[2] is not None else None,
             }
     except Exception:
         pass
     return {}
+
+
+def latest_liquidity_snapshot() -> LiquiditySnapshot | None:
+    macro_codes = (
+        "FED_BALANCE_SHEET",
+        "FRED_WALCL",
+        "TGA",
+        "FRED_TGA",
+        "REVERSE_REPO",
+        "FRED_RRPONTSYD",
+    )
+    try:
+        with db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT timestamp, indicator_code, value
+                    FROM macro_liquidity_indicators
+                    WHERE indicator_code = ANY(%s)
+                    ORDER BY timestamp DESC
+                    LIMIT 120
+                    """,
+                    (list(macro_codes),),
+                )
+                macro_rows = cursor.fetchall()
+                cursor.execute(
+                    """
+                    SELECT timestamp, rbi_total_assets, net_laf_absorption,
+                           marginal_standing_facility, standing_deposit_facility,
+                           fii_net_flow_usd, dii_net_flow_inr
+                    FROM india_liquidity_flows
+                    ORDER BY timestamp DESC
+                    LIMIT 30
+                    """
+                )
+                india_rows = cursor.fetchall()
+                cursor.execute(
+                    """
+                    SELECT timestamp, token_symbol, daily_growth_pct
+                    FROM stablecoin_liquidity_growth
+                    ORDER BY timestamp DESC
+                    LIMIT 150
+                    """
+                )
+                crypto_rows = cursor.fetchall()
+    except Exception:
+        return None
+
+    us_by_timestamp: dict[datetime, dict[str, float]] = {}
+    for timestamp, indicator_code, value in macro_rows:
+        if value is None:
+            continue
+        inputs = us_by_timestamp.setdefault(timestamp, {})
+        key = {
+            "FED_BALANCE_SHEET": "fed_balance_sheet",
+            "FRED_WALCL": "fed_balance_sheet",
+            "TGA": "tga",
+            "FRED_TGA": "tga",
+            "REVERSE_REPO": "reverse_repo",
+            "FRED_RRPONTSYD": "reverse_repo",
+        }.get(str(indicator_code))
+        if key:
+            inputs[key] = float(value)
+
+    india_inputs = [
+        LiquidityInput(
+            timestamp=row[0],
+            values={
+                "rbi_liquidity": row[1],
+                "laf": row[2],
+                "msf": row[3],
+                "sdf": row[4],
+                "fii_flows": row[5],
+                "dii_flows": row[6],
+            },
+        )
+        for row in india_rows
+    ]
+    crypto_by_timestamp: dict[datetime, dict[str, float]] = {}
+    for timestamp, token_symbol, growth in crypto_rows:
+        if growth is None:
+            continue
+        inputs = crypto_by_timestamp.setdefault(timestamp, {})
+        symbol = str(token_symbol).upper()
+        if symbol == "STABLECOIN_TOTAL":
+            inputs["stablecoin_supply_growth"] = float(growth)
+        elif symbol == "USDT":
+            inputs["usdt_growth"] = float(growth)
+        elif symbol == "USDC":
+            inputs["usdc_growth"] = float(growth)
+
+    snapshots = LiquidityEngine().build_daily_indices(
+        us_inputs=[LiquidityInput(timestamp, values) for timestamp, values in us_by_timestamp.items()],
+        india_inputs=india_inputs,
+        crypto_inputs=[LiquidityInput(timestamp, values) for timestamp, values in crypto_by_timestamp.items()],
+        macro_inputs=(),
+    )
+    return snapshots[-1] if snapshots else None
+
+
+def latest_discovery_score() -> float | None:
+    try:
+        with db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT AVG(current_score)
+                    FROM feature_lifecycle_registry
+                    WHERE current_state IN ('WATCH', 'PROMOTED')
+                    """
+                )
+                row = cursor.fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+    except Exception:
+        return None
+
+
+def walk_forward_win_rate(metrics: dict[str, float | str]) -> float | None:
+    keys = (
+        "forecast_accuracy_3m",
+        "forecast_accuracy_6m",
+        "forecast_accuracy_12m",
+        "panic_prediction_hit_rate",
+        "recovery_prediction_hit_rate",
+        "buy_signal_success_rate",
+        "sell_signal_success_rate",
+    )
+    values = [read_float(metrics.get(key), -1.0) for key in keys]
+    usable = [value for value in values if 0.0 <= value <= 100.0]
+    return round(sum(usable) / len(usable) / 100.0, 6) if usable else None
+
+
+def latest_market_volatility_index() -> float | None:
+    try:
+        with db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT close_price
+                    FROM daily_market_metrics
+                    WHERE asset_id IN ('NIFTY 50', 'NIFTY50', '^NSEI')
+                    ORDER BY timestamp DESC
+                    LIMIT 22
+                    """
+                )
+                prices = [float(row[0]) for row in cursor.fetchall() if row[0] is not None and float(row[0]) > 0.0]
+    except Exception:
+        return None
+    if len(prices) < 2:
+        return None
+    ordered = list(reversed(prices))
+    returns = [ordered[index] / ordered[index - 1] - 1.0 for index in range(1, len(ordered))]
+    return round(bounded(pstdev(returns) * math.sqrt(252.0) * 100.0, 0.0, 100.0), 6)
 
 
 def latest_systemic_stress() -> float | None:
@@ -1777,7 +1938,7 @@ def historical_validation_samples() -> list[ForecastValidationSample]:
                 realized_drawdown = realized_market_drawdown(connection, forecast_date, 12)
                 if realized_return is None:
                     continue
-                outcome = 1 if realized_return < -0.08 else 0
+                outcome = 1 if realized_return < SYSTEMIC_STRESS_RETURN_THRESHOLD else 0
                 samples.append(
                     ForecastValidationSample(
                         probability=read_forecast_value(forecast_value),
@@ -2060,7 +2221,7 @@ def forecast_accuracy(connection: Any, horizon_months: int) -> float:
         realized_return = realized_market_return(connection, forecast_date, horizon_months)
         if realized_return is None:
             continue
-        realized_stress = 1.0 if realized_return < -0.08 else 0.0
+        realized_stress = 1.0 if realized_return < SYSTEMIC_STRESS_RETURN_THRESHOLD else 0.0
         scores.append(1.0 - abs(bounded(value, 0.0, 1.0) - realized_stress))
     return percentage_average(scores, neutral=50.0)
 
@@ -2077,7 +2238,7 @@ def signal_hit_rate(connection: Any, forecast_type: str) -> float:
         parsed = read_forecast_value(value)
         if forecast_type in {"panic_probability_12m", "sell_score"}:
             predicted = parsed >= (0.60 if forecast_type == "panic_probability_12m" else 60.0)
-            realized = realized_return < -0.08
+            realized = realized_return < SYSTEMIC_STRESS_RETURN_THRESHOLD
         else:
             predicted = parsed >= (60.0 if "score" in forecast_type else 60.0)
             realized = realized_return > 0.05
@@ -2357,56 +2518,11 @@ def apply_valuation_overlay(matrix: ProbabilityMatrix, valuation: dict[str, floa
 
 
 def decision_outputs_from_matrix(matrix: ProbabilityMatrix, *, credit_stress_index: float, valuation: dict[str, float | str]) -> dict[str, float]:
-    probabilities = matrix.probabilities
-    market_crash = probabilities["market_crash"][12]
-    systemic_stress = probabilities["systemic_stress"][12]
-    liquidity_contraction = probabilities["liquidity_contraction"][12]
-    sector_stress = probabilities["sector_stress"][12]
-    crypto_recovery = 1.0 - probabilities["crypto_risk_off"][12]
-    confidence = normalize_confidence(matrix.confidence_score)
-    credit_stress = bounded(credit_stress_index, 0.0, 100.0) / 100.0
-    valuation_score = read_float(valuation.get("valuation_score"), 50.0) / 100.0
-    valuation_risk = read_float(valuation.get("valuation_risk_score"), 50.0) / 100.0
-    panic_probability = bounded(
-        market_crash * 0.31
-        + systemic_stress * 0.31
-        + liquidity_contraction * 0.18
-        + sector_stress * 0.10
-        + credit_stress * 0.08
-        + valuation_risk * 0.02,
-        0.0,
-        1.0,
-    )
-    recovery_probability = bounded(
-        (1.0 - panic_probability) * 0.50
-        + crypto_recovery * 0.25
-        + (1.0 - liquidity_contraction) * 0.13
-        + (1.0 - credit_stress) * 0.10
-        + valuation_score * 0.02,
-        0.0,
-        1.0,
-    )
-    recovery_12m, recovery_24m = calculate_recovery_probabilities(
-        market_crash_12m=market_crash,
-        systemic_stress_12m=systemic_stress,
+    return shared_decision_outputs_from_matrix(
+        matrix,
+        credit_stress_index=credit_stress_index,
+        valuation=valuation,
         liquidity_index=latest_macro_value("GLOBAL_LIQUIDITY_INDEX", 55.0),
-        credit_stress_index=credit_stress_index,
-        recovery_signal=recovery_probability,
-        expected_return_proxy=None,
-        expected_drawdown_proxy=None,
-    )
-    return build_decision_outputs(
-        credit_stress_index=credit_stress_index,
-        valuation_score=read_float(valuation.get("valuation_score"), 50.0),
-        valuation_risk_score=read_float(valuation.get("valuation_risk_score"), 50.0),
-        valuation_percentile=read_float(valuation.get("valuation_percentile"), 50.0),
-        recovery_probability_12m=recovery_12m,
-        recovery_probability_24m=recovery_24m,
-        panic_probability=panic_probability,
-        recovery_probability=recovery_probability,
-        confidence=confidence,
-        market_crash_12m=market_crash,
-        sector_stress_12m=sector_stress,
     )
 
 
@@ -2489,90 +2605,6 @@ def precious_metals_outputs_from_row(row: dict[str, Any], *, credit_stress_index
             gold_silver_ratio=calculate_gold_silver_ratio(),
         )
     ).to_dict()
-
-
-def calculate_recovery_probabilities(
-    *,
-    market_crash_12m: float,
-    systemic_stress_12m: float,
-    liquidity_index: float,
-    credit_stress_index: float,
-    recovery_signal: float,
-    expected_return_proxy: float | None,
-    expected_drawdown_proxy: float | None,
-) -> tuple[float, float]:
-    crash = bounded(market_crash_12m, 0.0, 1.0)
-    systemic = bounded(systemic_stress_12m, 0.0, 1.0)
-    liquidity = bounded(liquidity_index, 0.0, 100.0) / 100.0
-    credit_repair = 1.0 - bounded(credit_stress_index, 0.0, 100.0) / 100.0
-    recovery_base = bounded(recovery_signal, 0.0, 1.0)
-    positive_return = bounded(((expected_return_proxy if expected_return_proxy is not None else 0.0) + 0.25) / 0.50, 0.0, 1.0)
-    drawdown_repair = 1.0 - bounded(expected_drawdown_proxy if expected_drawdown_proxy is not None else max(crash, systemic) * 0.45, 0.0, 0.80) / 0.80
-    stress_reset = bounded((crash + systemic) / 2.0, 0.0, 1.0)
-    moderate_stress = 1.0 - abs(stress_reset - 0.45) / 0.45
-    moderate_stress = bounded(moderate_stress, 0.0, 1.0)
-    recovery_12m = (
-        recovery_base * 0.28
-        + liquidity * 0.20
-        + credit_repair * 0.18
-        + positive_return * 0.14
-        + drawdown_repair * 0.10
-        + moderate_stress * 0.10
-    )
-    recovery_24m = (
-        recovery_12m * 0.58
-        + liquidity * 0.18
-        + credit_repair * 0.14
-        + drawdown_repair * 0.10
-    )
-    return round(bounded(recovery_12m * 100.0, 0.0, 100.0), 6), round(bounded(recovery_24m * 100.0, 0.0, 100.0), 6)
-
-
-def build_decision_outputs(
-    *,
-    credit_stress_index: float,
-    valuation_score: float,
-    valuation_risk_score: float,
-    valuation_percentile: float,
-    recovery_probability_12m: float,
-    recovery_probability_24m: float,
-    panic_probability: float,
-    recovery_probability: float,
-    confidence: float,
-    market_crash_12m: float,
-    sector_stress_12m: float,
-) -> dict[str, float]:
-    panic = bounded(panic_probability, 0.0, 1.0)
-    recovery = bounded(recovery_probability, 0.0, 1.0)
-    confidence = normalize_confidence(confidence)
-    recovery_12m = bounded(recovery_probability_12m, 0.0, 100.0) / 100.0
-    recovery_24m = bounded(recovery_probability_24m, 0.0, 100.0) / 100.0
-    valuation_attractiveness = bounded(valuation_score, 0.0, 100.0) / 100.0
-    valuation_risk = bounded(valuation_risk_score, 0.0, 100.0) / 100.0
-    conviction = 0.55 + confidence * 0.45
-    raw_buy = max(0.01, (recovery * 0.62 + recovery_12m * 0.25 + valuation_attractiveness * 0.13) * conviction)
-    raw_sell = max(0.01, (panic * 0.78 + (1.0 - recovery_12m) * 0.12 + valuation_risk * 0.10) * conviction)
-    raw_hold = max(0.01, (1.0 - abs(recovery - panic)) * (1.15 - conviction))
-    total = raw_buy + raw_hold + raw_sell
-    buy_score = round(raw_buy / total * 100.0, 2)
-    sell_score = round(raw_sell / total * 100.0, 2)
-    hold_score = round(max(0.0, 100.0 - buy_score - sell_score), 2)
-    credit_stress = bounded(credit_stress_index, 0.0, 100.0) / 100.0
-    expected_return = bounded(recovery * 0.16 + recovery_12m * 0.07 + recovery_24m * 0.04 + valuation_attractiveness * 0.06 - panic * 0.27 - credit_stress * 0.05 + (confidence - 0.50) * 0.04, -0.50, 0.50)
-    expected_drawdown = bounded(panic * 0.38 + market_crash_12m * 0.10 + sector_stress_12m * 0.05 + credit_stress * 0.10 + valuation_risk * 0.08, 0.0, 0.80)
-    return {
-        "credit_stress_index": round(bounded(credit_stress_index, 0.0, 100.0), 6),
-        "valuation_score": round(bounded(valuation_score, 0.0, 100.0), 6),
-        "valuation_risk_score": round(bounded(valuation_risk_score, 0.0, 100.0), 6),
-        "valuation_percentile": round(bounded(valuation_percentile, 0.0, 100.0), 6),
-        "recovery_probability_12m": round(bounded(recovery_probability_12m, 0.0, 100.0), 6),
-        "recovery_probability_24m": round(bounded(recovery_probability_24m, 0.0, 100.0), 6),
-        "buy_score": buy_score,
-        "hold_score": hold_score,
-        "sell_score": sell_score,
-        "expected_return_12m": round(expected_return, 6),
-        "expected_drawdown_12m": round(expected_drawdown, 6),
-    }
 
 
 def normalize_confidence(value: float) -> float:

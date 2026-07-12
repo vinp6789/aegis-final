@@ -6,6 +6,7 @@ from statistics import mean
 from typing import Callable, Mapping, Sequence
 
 from analytics.common import clamp
+from analytics.validation.model_validation import SYSTEMIC_STRESS_RETURN_THRESHOLD
 
 
 @dataclass(frozen=True)
@@ -154,7 +155,7 @@ def signal_quality(observation: ReplayObservation) -> float:
     realized_return = observation.realized_return
     if realized_return is None:
         return 0.5
-    panic_alignment = 1.0 - abs(observation.panic_probability / 100.0 - (1.0 if realized_return < -0.08 else 0.0))
+    panic_alignment = 1.0 - abs(observation.panic_probability / 100.0 - (1.0 if realized_return < SYSTEMIC_STRESS_RETURN_THRESHOLD else 0.0))
     recovery_alignment = 1.0 - abs(observation.recovery_probability / 100.0 - (1.0 if realized_return > 0.05 else 0.0))
     return clamp((panic_alignment + recovery_alignment) / 2.0, 0.0, 1.0)
 

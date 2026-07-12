@@ -8,6 +8,9 @@ from analytics.common import clamp
 from analytics.validation.calibration import brier_score, expected_calibration_error
 
 
+SYSTEMIC_STRESS_RETURN_THRESHOLD = -0.08
+
+
 MODEL_INVENTORY = (
     {
         "model": "Regime classifier",
@@ -269,4 +272,3 @@ def validation_status_lists() -> dict[str, list[str]]:
         "unvalidated_models": unvalidated,
         "overconfident_models": overconfident,
     }
-

@@ -5,15 +5,20 @@ from datetime import datetime, timezone
 
 from analytics.research.historical_backfill import (
     HistoricalBackfillPipeline,
+    HistoricalReplayEngine,
     HistoricalPoint,
     MARKET_EVENT_CATALOG,
+    ReconstructedForecast,
     build_coverage_report,
     build_research_report,
     build_validation_dataset,
     coverage_summary,
     coverage_report_from_points,
+    historical_replay_validation_statistics,
+    point_in_time_feature_row,
     research_report_to_dict,
 )
+from analytics.validation.model_validation import SYSTEMIC_STRESS_RETURN_THRESHOLD
 
 
 class HistoricalBackfillTest(unittest.TestCase):
@@ -41,7 +46,7 @@ class HistoricalBackfillTest(unittest.TestCase):
         for event_id in {"1907", "1929", "1973", "1987", "1998", "2000", "2008", "2011", "2020", "2022"}:
             self.assertIn(event_id, ids)
 
-    def test_reconstructed_forecasts_are_marked_as_reconstructed(self) -> None:
+    def test_reconstructed_forecasts_are_marked_as_point_in_time_replay(self) -> None:
         pipeline = HistoricalBackfillPipeline()
         points_by_code = sample_points()
 
@@ -52,8 +57,93 @@ class HistoricalBackfillTest(unittest.TestCase):
         self.assertIn("panic_probability_12m", forecast_types)
         self.assertIn("expected_drawdown_12m", forecast_types)
         for forecast in forecasts:
-            self.assertEqual(forecast.metadata["source"], "historical_reconstruction")
-            self.assertTrue(forecast.metadata["not_live_forecast"])
+            self.assertEqual(forecast.metadata["source"], "historical_replay")
+            self.assertEqual(forecast.metadata["forecast_origin"], "historical_replay")
+            self.assertTrue(forecast.metadata["replay_generated"])
+            self.assertTrue(forecast.metadata["no_lookahead"])
+
+    def test_point_in_time_features_do_not_use_future_values(self) -> None:
+        points = sample_points()
+        future = datetime(2008, 2, 1, tzinfo=timezone.utc)
+        points["SHILLER_CAPE"].append(HistoricalPoint(future, "SHILLER_CAPE", 99.0, "future"))
+
+        row = point_in_time_feature_row(points, datetime(2007, 1, 1, tzinfo=timezone.utc))
+
+        self.assertEqual(row["SHILLER_CAPE"], 28.0)
+
+    def test_replay_generates_production_shaped_outputs_and_resume_skips(self) -> None:
+        pipeline = HistoricalBackfillPipeline()
+        points = validation_points()
+
+        run = pipeline.replay_history(
+            points,
+            start=datetime(2007, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2007, 3, 1, tzinfo=timezone.utc),
+            completed_months=[datetime(2007, 2, 1, tzinfo=timezone.utc)],
+        )
+
+        self.assertEqual(run.summary.completed_months, 2)
+        self.assertEqual(len(run.summary.skipped_months), 1)
+        self.assertEqual(run.summary.skipped_months[0].reason, "already completed")
+        output = run.predictions[0].outputs
+        for key in (
+            "market_crash_12m",
+            "systemic_stress_12m",
+            "buy_score",
+            "hold_score",
+            "sell_score",
+            "expected_return_12m",
+            "expected_drawdown_12m",
+            "regime_state",
+            "confidence",
+            "credit_stress_index",
+            "valuation_score",
+            "gold_bull_probability",
+            "silver_bear_probability",
+        ):
+            self.assertIn(key, output)
+
+    def test_replay_validation_statistics_include_requested_metrics(self) -> None:
+        run = HistoricalReplayEngine().run(validation_points())
+
+        metrics = historical_replay_validation_statistics(run.validation_rows)
+
+        for key in (
+            "brier_score",
+            "precision",
+            "recall",
+            "roc_auc",
+            "calibration_error",
+            "f1_score",
+            "prediction_lead_time",
+            "false_positive_rate",
+            "false_negative_rate",
+            "maximum_drawdown_avoided",
+            "annualized_return",
+            "sharpe_ratio",
+            "sortino_ratio",
+            "confusion_matrix",
+            "calibration_curve",
+            "model_reliability_trend",
+        ):
+            self.assertIn(key, metrics)
+
+    def test_validation_uses_production_systemic_stress_threshold(self) -> None:
+        start = datetime(2008, 1, 1, tzinfo=timezone.utc)
+        points = {
+            "SP500": [
+                HistoricalPoint(start, "SP500", 100.0, "test"),
+                HistoricalPoint(datetime(2009, 1, 1, tzinfo=timezone.utc), "SP500", 90.0, "test"),
+            ]
+        }
+        forecasts = [
+            ReconstructedForecast(start, "panic_probability_12m", 0.60, 70.0, {"source": "test"}),
+        ]
+
+        rows = build_validation_dataset(points, forecasts)
+
+        self.assertEqual(SYSTEMIC_STRESS_RETURN_THRESHOLD, -0.08)
+        self.assertEqual(rows[0].realized_outcome, 1)
 
     def test_persist_writes_only_existing_tables(self) -> None:
         pipeline = HistoricalBackfillPipeline()
@@ -164,6 +254,38 @@ class HistoricalBackfillTest(unittest.TestCase):
         self.assertIn("forecast_history", sql)
         self.assertIn("data_quality_exceptions", sql)
 
+    def test_persist_replay_run_uses_forecast_history_with_replay_metadata(self) -> None:
+        pipeline = HistoricalBackfillPipeline()
+        connection = FakeConnection()
+        run = pipeline.replay_history(validation_points())
+
+        counts = pipeline.persist_replay_run(connection, run)
+
+        self.assertGreater(counts["forecast_history"], 0)
+        self.assertGreater(counts["historical_validation_rows"], 0)
+        self.assertEqual(counts["research_report"], 0)
+        sql = "\n".join(connection.cursor_obj.executed_sql)
+        self.assertIn("forecast_history", sql)
+        self.assertNotIn("CREATE TABLE", sql.upper())
+        forecast_payloads = connection.cursor_obj.executed_params[0]
+        first_metadata = forecast_payloads[0][5]
+        self.assertIn('"source": "historical_replay"', first_metadata)
+        self.assertIn('"forecast_origin": "historical_replay"', first_metadata)
+        self.assertIn('"replay_generated": true', first_metadata)
+        self.assertIn('"no_lookahead": true', first_metadata)
+
+    def test_completed_replay_months_reads_existing_forecast_history_rows(self) -> None:
+        replay_date = datetime(2007, 1, 15, tzinfo=timezone.utc)
+        connection = FakeConnection(fetch_rows=[(replay_date,)])
+
+        completed = HistoricalBackfillPipeline().completed_replay_months(connection)
+
+        self.assertEqual(completed, {datetime(2007, 1, 1, tzinfo=timezone.utc)})
+        sql = "\n".join(connection.cursor_obj.executed_sql)
+        self.assertIn("forecast_history", sql)
+        self.assertIn("metadata->>'source' = 'historical_replay'", sql)
+        self.assertEqual(connection.cursor_obj.executed_params[0], ("GLOBAL",))
+
 
 def sample_points() -> dict[str, list[HistoricalPoint]]:
     timestamps = [datetime(2007, month, 1, tzinfo=timezone.utc) for month in range(1, 13)]
@@ -207,16 +329,18 @@ def validation_points() -> dict[str, list[HistoricalPoint]]:
 
 
 class FakeConnection:
-    def __init__(self) -> None:
-        self.cursor_obj = FakeCursor()
+    def __init__(self, fetch_rows: list[tuple[object, ...]] | None = None) -> None:
+        self.cursor_obj = FakeCursor(fetch_rows or [])
 
     def cursor(self) -> "FakeCursor":
         return self.cursor_obj
 
 
 class FakeCursor:
-    def __init__(self) -> None:
+    def __init__(self, fetch_rows: list[tuple[object, ...]]) -> None:
         self.executed_sql: list[str] = []
+        self.executed_params: list[object] = []
+        self.fetch_rows = fetch_rows
 
     def __enter__(self) -> "FakeCursor":
         return self
@@ -226,9 +350,14 @@ class FakeCursor:
 
     def execute(self, sql: str, _params: object = None) -> None:
         self.executed_sql.append(sql)
+        self.executed_params.append(_params)
 
     def executemany(self, sql: str, _params: object = None) -> None:
         self.executed_sql.append(sql)
+        self.executed_params.append(_params)
+
+    def fetchall(self) -> list[tuple[object, ...]]:
+        return self.fetch_rows
 
 
 if __name__ == "__main__":
